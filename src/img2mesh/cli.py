@@ -6,17 +6,25 @@ import math
 from collections.abc import Sequence
 from pathlib import Path
 
-from .config import Img2MeshError, InputError, OutputError
+from .config import Img2MeshError, InputError, OutputError, ReconstructionError
 from .geometry import CameraIntrinsics
-from .image import PreprocessingOptions, preprocess_image
+from .image import (
+    PreprocessingOptions,
+    clean_mask,
+    largest_component,
+    preprocess_image,
+    segment_foreground,
+)
 from .io import (
     SUPPORTED_IMAGE_EXTENSIONS,
     export_mesh,
+    extract_exif_focal_length,
     load_image,
     validate_image_path,
 )
 from .mesh import generate_mesh
 from .pipeline import reconstruct_image_set
+from .silhouette import reconstruct_visual_hull
 
 __version__ = "0.1.0"
 
@@ -193,11 +201,29 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Image pairing strategy (default: all).",
     )
-    parser.add_argument(
+    alpha_group = parser.add_mutually_exclusive_group()
+    alpha_group.add_argument(
         "--alpha",
         type=_positive_float,
         default=None,
         help="Alpha-shape radius (omit for convex hull).",
+    )
+    alpha_group.add_argument(
+        "--auto-alpha",
+        action="store_true",
+        help="Automatically estimate alpha-shape radius from point spacing.",
+    )
+    parser.add_argument(
+        "--segment-foreground",
+        choices=("none", "otsu", "adaptive"),
+        default="none",
+        help="Foreground segmentation mask for feature extraction (default: none).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("sfm", "silhouette", "auto"),
+        default="sfm",
+        help="Reconstruction mode (default: sfm).",
     )
     parser.add_argument(
         "--no-bundle-adjustment",
@@ -328,24 +354,100 @@ def main(argv: Sequence[str] | None = None) -> int:
                 images[0].height,
                 args.focal_length,
             )
+        else:
+            exif_focal = extract_exif_focal_length(
+                image_paths[0],
+                target_size=images[0].size,
+            )
+            if exif_focal is not None:
+                LOGGER.debug("Using EXIF focal length: %.2f px", exif_focal)
+                reconstruction_kwargs["intrinsics"] = (
+                    CameraIntrinsics.from_focal_length(
+                        images[0].width,
+                        images[0].height,
+                        exif_focal,
+                    )
+                )
 
-        reconstruction = reconstruct_image_set(
-            images,
-            **reconstruction_kwargs,
-        )
+        if args.segment_foreground != "none":
+            masks = []
+            for image in images:
+                raw_mask = segment_foreground(image, method=args.segment_foreground)
+                cleaned_mask = largest_component(clean_mask(raw_mask))
+                if not cleaned_mask.any():
+                    cleaned_mask = None
+                masks.append(cleaned_mask)
+            if all(mask is not None for mask in masks):
+                reconstruction_kwargs["masks"] = masks
 
-        LOGGER.info(
-            "Reconstruction completed: %d cameras and %d sparse 3D points.",
-            reconstruction.camera_count,
-            reconstruction.point_count,
-        )
+        if args.mode == "silhouette":
+            vh_kwargs = {}
+            if "intrinsics" in reconstruction_kwargs:
+                vh_kwargs["intrinsics"] = reconstruction_kwargs["intrinsics"]
+            if "masks" in reconstruction_kwargs:
+                vh_kwargs["masks"] = reconstruction_kwargs["masks"]
+            vh_result = reconstruct_visual_hull(images, **vh_kwargs)
+            mesh = vh_result.mesh
+            LOGGER.info(
+                "Silhouette reconstruction completed: mean IoU=%.2f%%, "
+                "min IoU=%.2f%%, mean Dice=%.2f%%.",
+                vh_result.mean_iou * 100.0,
+                vh_result.min_iou * 100.0,
+                vh_result.mean_dice * 100.0,
+            )
+        else:
+            reconstruction = None
+            sfm_error = None
+            try:
+                reconstruction = reconstruct_image_set(
+                    images,
+                    **reconstruction_kwargs,
+                )
+            except ReconstructionError as exc:
+                if args.mode != "auto":
+                    raise
+                sfm_error = exc
 
-        LOGGER.info("Generating triangle mesh.")
-
-        mesh = generate_mesh(
-            reconstruction.points_3d,
-            alpha=args.alpha,
-        )
+            if (
+                args.mode == "auto"
+                and (
+                    reconstruction is None
+                    or reconstruction.camera_count < len(images)
+                    or reconstruction.point_count < 32
+                )
+            ):
+                LOGGER.info(
+                    "Falling back to silhouette visual-hull reconstruction%s.",
+                    f" ({sfm_error})" if sfm_error else "",
+                )
+                vh_kwargs = {}
+                if "intrinsics" in reconstruction_kwargs:
+                    vh_kwargs["intrinsics"] = reconstruction_kwargs["intrinsics"]
+                if "masks" in reconstruction_kwargs:
+                    vh_kwargs["masks"] = reconstruction_kwargs["masks"]
+                vh_result = reconstruct_visual_hull(images, **vh_kwargs)
+                mesh = vh_result.mesh
+                LOGGER.info(
+                    "Silhouette reconstruction completed: mean IoU=%.2f%%, "
+                    "min IoU=%.2f%%, mean Dice=%.2f%%.",
+                    vh_result.mean_iou * 100.0,
+                    vh_result.min_iou * 100.0,
+                    vh_result.mean_dice * 100.0,
+                )
+            else:
+                LOGGER.info(
+                    "Reconstruction completed: %d cameras and %d sparse 3D points.",
+                    reconstruction.camera_count,
+                    reconstruction.point_count,
+                )
+                LOGGER.info("Generating triangle mesh.")
+                mesh_kwargs = {"alpha": args.alpha}
+                if args.auto_alpha:
+                    mesh_kwargs["auto_alpha"] = True
+                mesh = generate_mesh(
+                    reconstruction.points_3d,
+                    **mesh_kwargs,
+                )
 
         LOGGER.info(
             "Mesh generated: %d vertices and %d faces.",

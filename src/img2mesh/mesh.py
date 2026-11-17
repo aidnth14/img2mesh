@@ -99,10 +99,70 @@ def _circumradius(tetrahedron: np.ndarray) -> float:
     return float(np.linalg.norm(center - origin))
 
 
+def estimate_alpha(
+    points,
+    *,
+    clean: bool = True,
+    neighbors: int = 8,
+    std_ratio: float = 2.0,
+) -> float:
+    """Estimate an adaptive alpha-shape radius from local point spacing."""
+    cloud = _validate_points(points)
+    if not isinstance(clean, bool):
+        raise ReconstructionError("clean must be True or False.")
+
+    if clean:
+        cloud = clean_point_cloud(
+            cloud,
+            neighbors=neighbors,
+            std_ratio=std_ratio,
+        )
+
+    if len(cloud) < 4:
+        raise ReconstructionError(
+            "Alpha estimation requires at least four distinct points."
+        )
+
+    k = min(4, len(cloud) - 1)
+    distances, _ = cKDTree(cloud).query(cloud, k=k + 1)
+    kth_distances = distances[:, k]
+    spacing = float(np.percentile(kth_distances, 80))
+    if not np.isfinite(spacing) or spacing <= 0:
+        positive = distances[:, 1:][distances[:, 1:] > 0]
+        if len(positive) == 0:
+            raise ReconstructionError("Could not estimate alpha for degenerate points.")
+        spacing = float(np.median(positive))
+
+    candidate = 1.8 * spacing
+
+    try:
+        tetrahedralization = Delaunay(cloud)
+    except QhullError as exc:
+        raise ReconstructionError(
+            "Could not tetrahedralize the point cloud. "
+            "The points may be coplanar or geometrically degenerate."
+        ) from exc
+
+    radii = np.array(
+        [
+            _circumradius(cloud[simplex])
+            for simplex in tetrahedralization.simplices
+        ],
+        dtype=np.float64,
+    )
+    finite_radii = radii[np.isfinite(radii) & (radii > 0)]
+    if len(finite_radii) == 0:
+        raise ReconstructionError("No finite tetrahedra found for alpha estimation.")
+
+    min_feasible = float(np.percentile(finite_radii, 35))
+    return float(max(candidate, min_feasible))
+
+
 def generate_mesh(
     points,
     *,
     alpha: float | None = None,
+    auto_alpha: bool = False,
     clean: bool = True,
     neighbors: int = 8,
     std_ratio: float = 2.0,
@@ -112,6 +172,12 @@ def generate_mesh(
 
     if not isinstance(clean, bool):
         raise ReconstructionError("clean must be True or False.")
+
+    if not isinstance(auto_alpha, bool):
+        raise ReconstructionError("auto_alpha must be True or False.")
+
+    if alpha is not None and auto_alpha:
+        raise ReconstructionError("Cannot specify both alpha and auto_alpha.")
 
     if alpha is not None:
         if (
@@ -136,6 +202,10 @@ def generate_mesh(
             "Mesh generation requires at least four distinct points."
         )
 
+    effective_alpha = (
+        estimate_alpha(cloud, clean=False) if auto_alpha else alpha
+    )
+
     try:
         tetrahedralization = Delaunay(cloud)
     except QhullError as exc:
@@ -153,7 +223,7 @@ def generate_mesh(
         if not np.isfinite(radius):
             continue
 
-        if alpha is not None and radius > alpha:
+        if effective_alpha is not None and radius > effective_alpha:
             continue
 
         for opposite_index in range(4):
@@ -179,6 +249,21 @@ def generate_mesh(
 
     boundary_faces = [data[1] for data in face_map.values() if data[0] == 1]
 
+    if boundary_faces:
+        scale = float(np.max(np.ptp(cloud, axis=0)))
+        area_threshold = np.finfo(np.float64).eps * max(scale * scale, 1e-300)
+        boundary_faces = [
+            face
+            for face in boundary_faces
+            if np.linalg.norm(
+                np.cross(
+                    cloud[face[1]] - cloud[face[0]],
+                    cloud[face[2]] - cloud[face[0]],
+                )
+            )
+            > area_threshold
+        ]
+
     if not boundary_faces:
         raise ReconstructionError(
             "No mesh surface was generated. Increase alpha or check "
@@ -200,7 +285,7 @@ def generate_mesh(
     return MeshResult(
         vertices=vertices,
         faces=faces,
-        alpha=None if alpha is None else float(alpha),
+        alpha=None if effective_alpha is None else float(effective_alpha),
         input_point_count=input_count,
         retained_point_count=len(cloud),
     )

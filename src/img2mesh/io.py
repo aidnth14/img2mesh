@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import struct
 import tempfile
@@ -135,6 +136,62 @@ def load_image(
         raise InputError(f"Unable to decode image '{image_path}': {exc}") from exc
     finally:
         Image.MAX_IMAGE_PIXELS = previous_max_pixels
+
+
+def _exif_float(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result) or result <= 0:
+        return None
+    return result
+
+
+def extract_exif_focal_length(
+    path: str | Path,
+    *,
+    target_size: tuple[int, int] | None = None,
+) -> float | None:
+    """Estimate camera focal length in pixels from EXIF metadata, if present."""
+    try:
+        image_path = validate_image_path(path)
+        with Image.open(image_path) as source:
+            exif = source.getexif()
+            if not exif:
+                return None
+            oriented = ImageOps.exif_transpose(source)
+            try:
+                width, height = oriented.size
+            finally:
+                if oriented is not source:
+                    oriented.close()
+    except (InputError, OSError, UnidentifiedImageError, ValueError):
+        return None
+
+    exif_ifd = exif.get_ifd(0x8769) if hasattr(exif, "get_ifd") else {}
+
+    focal_35mm = _exif_float(exif_ifd.get(41989) or exif.get(41989))
+    focal_px = None
+    if focal_35mm is not None:
+        focal_px = (focal_35mm / 36.0) * max(width, height)
+    else:
+        focal_mm = _exif_float(exif_ifd.get(37386) or exif.get(37386))
+        x_res = _exif_float(exif_ifd.get(41486) or exif.get(41486))
+        res_unit = exif_ifd.get(41488) or exif.get(41488) or 2
+        unit_mm = {2: 25.4, 3: 10.0, 4: 1.0}.get(res_unit)
+        if focal_mm is not None and x_res is not None and unit_mm is not None:
+            focal_px = focal_mm * (x_res / unit_mm)
+
+    if focal_px is None or not math.isfinite(focal_px) or focal_px <= 0:
+        return None
+
+    if target_size is not None and width > 0 and height > 0:
+        target_w, target_h = target_size
+        scale = max(target_w, target_h) / max(width, height)
+        focal_px *= scale
+
+    return float(focal_px)
 
 
 def _prepare_mesh(mesh: MeshResult):

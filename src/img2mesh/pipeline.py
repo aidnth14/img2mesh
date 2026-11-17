@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import cv2
 import numpy as np
 from PIL import Image
 from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
+from scipy.sparse import coo_matrix
 from scipy.spatial.transform import Rotation
 
 from .config import ConfigurationError, ReconstructionError
@@ -18,6 +19,7 @@ from .geometry import (
     estimate_relative_pose,
     matched_keypoint_coordinates,
     register_camera_pnp,
+    triangulate_multiview_point,
     triangulate_points,
 )
 
@@ -139,41 +141,56 @@ def _validate_inputs(
     )
 
 
-def _build_jacobian_sparsity(
-    camera_count: int,
-    point_count: int,
-    camera_indices: np.ndarray,
-    point_indices: np.ndarray,
-):
-    observation_count = len(camera_indices)
-    pose_parameter_count = max(0, camera_count - 2) * 6
+def _skew_matrices(vectors: np.ndarray) -> np.ndarray:
+    """Return (N, 3, 3) skew-symmetric matrices for an (N, 3) array."""
+    skew = np.zeros((len(vectors), 3, 3), dtype=np.float64)
+    skew[:, 0, 1] = -vectors[:, 2]
+    skew[:, 0, 2] = vectors[:, 1]
+    skew[:, 1, 0] = vectors[:, 2]
+    skew[:, 1, 2] = -vectors[:, 0]
+    skew[:, 2, 0] = -vectors[:, 1]
+    skew[:, 2, 1] = vectors[:, 0]
+    return skew
 
-    sparsity = lil_matrix(
-        (
-            observation_count * 3,
-            pose_parameter_count + point_count * 3,
-        ),
-        dtype=np.int8,
-    )
 
-    for observation_id, (camera_id, point_id) in enumerate(
-        zip(camera_indices, point_indices, strict=True)
-    ):
-        pixel_rows = slice(observation_id * 2, observation_id * 2 + 2)
-        depth_row = 2 * observation_count + observation_id
+def _so3_left_jacobians(rotvecs: np.ndarray) -> np.ndarray:
+    """Compute exact SO(3) left Jacobians for an (N, 3) array of rotvecs."""
+    count = len(rotvecs)
+    angles = np.linalg.norm(rotvecs, axis=1)
+    k_mats = _skew_matrices(rotvecs)
+    k_sq = k_mats @ k_mats
+    eye = np.broadcast_to(np.eye(3, dtype=np.float64), (count, 3, 3)).copy()
 
-        if camera_id >= 2:
-            camera_start = (camera_id - 2) * 6
-            camera_columns = slice(camera_start, camera_start + 6)
-            sparsity[pixel_rows, camera_columns] = 1
-            sparsity[depth_row, camera_columns] = 1
+    small = angles < 1e-6
+    coef1 = np.empty(count, dtype=np.float64)
+    coef2 = np.empty(count, dtype=np.float64)
 
-        point_start = pose_parameter_count + point_id * 3
-        point_columns = slice(point_start, point_start + 3)
-        sparsity[pixel_rows, point_columns] = 1
-        sparsity[depth_row, point_columns] = 1
+    coef1[small] = 0.5 - (angles[small] ** 2) / 24.0
+    coef2[small] = (1.0 / 6.0) - (angles[small] ** 2) / 120.0
 
-    return sparsity.tocsr()
+    nz = ~small
+    if np.any(nz):
+        th = angles[nz]
+        th2 = th * th
+        coef1[nz] = (1.0 - np.cos(th)) / th2
+        coef2[nz] = (th - np.sin(th)) / (th2 * th)
+
+    return eye + coef1[:, None, None] * k_mats + coef2[:, None, None] * k_sq
+
+
+def _tangent_basis(vector: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
+    """Return (norm, unit_dir, (3, 2) orthonormal tangent basis) for vector."""
+    norm = float(np.linalg.norm(vector))
+    unit = vector / norm
+    if abs(unit[0]) < 0.9:
+        helper = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        helper = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    e1 = np.cross(unit, helper)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(unit, e1)
+    e2 /= np.linalg.norm(e2)
+    return norm, unit, np.column_stack((e1, e2))
 
 
 def bundle_adjust(
@@ -188,6 +205,7 @@ def bundle_adjust(
     robust_loss: str = "soft_l1",
     f_scale: float = 1.0,
     max_nfev: int = 200,
+    fix_second_camera: bool = True,
 ) -> BundleAdjustmentResult:
     if not isinstance(intrinsics, CameraIntrinsics):
         raise ConfigurationError("intrinsics must be a CameraIntrinsics instance.")
@@ -212,6 +230,9 @@ def bundle_adjust(
     if isinstance(max_nfev, bool) or not isinstance(max_nfev, int) or max_nfev < 1:
         raise ConfigurationError("max_nfev must be a positive integer.")
 
+    if not isinstance(fix_second_camera, bool):
+        raise ConfigurationError("fix_second_camera must be True or False.")
+
     (
         initial_rotations,
         initial_translations,
@@ -230,23 +251,43 @@ def bundle_adjust(
 
     camera_count = len(initial_rotations)
     point_count = len(initial_points)
+    obs_count = len(observations)
 
-    pose_parameters = np.column_stack(
+    t1_norm, t1_dir, t1_basis = _tangent_basis(initial_translations[1])
+    cam1_param_count = 0 if fix_second_camera else 5
+    other_cam_param_count = max(0, camera_count - 2) * 6
+    pose_parameter_count = cam1_param_count + other_cam_param_count
+
+    other_pose_params = np.column_stack(
         (
             initial_rotations[2:],
             initial_translations[2:],
         )
     ).ravel()
 
-    x0 = np.concatenate((pose_parameters, initial_points.ravel()))
-    pose_parameter_count = len(pose_parameters)
+    if fix_second_camera:
+        x0 = np.concatenate((other_pose_params, initial_points.ravel()))
+    else:
+        cam1_init = np.concatenate(
+            (initial_rotations[1], np.zeros(2, dtype=np.float64))
+        )
+        x0 = np.concatenate((cam1_init, other_pose_params, initial_points.ravel()))
+
+    total_params = len(x0)
 
     def unpack(parameters):
         rotations = initial_rotations.copy()
         translations = initial_translations.copy()
 
+        if not fix_second_camera:
+            rotations[1] = parameters[:3]
+            w = t1_dir + t1_basis @ parameters[3:5]
+            translations[1] = (t1_norm / np.linalg.norm(w)) * w
+
         if camera_count > 2:
-            camera_parameters = parameters[:pose_parameter_count].reshape(-1, 6)
+            camera_parameters = parameters[
+                cam1_param_count:pose_parameter_count
+            ].reshape(-1, 6)
             rotations[2:] = camera_parameters[:, :3]
             translations[2:] = camera_parameters[:, 3:]
 
@@ -281,6 +322,132 @@ def bundle_adjust(
 
         return np.concatenate((pixel_residuals.ravel(), depth_penalties))
 
+    def calculate_jacobian(parameters):
+        rotations, translations, points = unpack(parameters)
+        rotation_matrices = Rotation.from_rotvec(rotations).as_matrix()
+        left_jacs = _so3_left_jacobians(rotations)
+
+        rotated_points = np.einsum(
+            "nij,nj->ni",
+            rotation_matrices[camera_ids],
+            points[point_ids],
+        )
+        camera_points = rotated_points + translations[camera_ids]
+
+        depth = camera_points[:, 2]
+        clamped = depth <= 1e-8
+        safe_depth = np.maximum(depth, 1e-8)
+        inv_z = 1.0 / safe_depth
+        inv_z2 = inv_z * inv_z
+
+        # d(u, v) / d(q) with shape (M, 2, 3)
+        d_uv_dq = np.zeros((obs_count, 2, 3), dtype=np.float64)
+        d_uv_dq[:, 0, 0] = intrinsics.fx * inv_z
+        d_uv_dq[:, 1, 1] = intrinsics.fy * inv_z
+        active = ~clamped
+        d_uv_dq[active, 0, 2] = (
+            -intrinsics.fx * camera_points[active, 0] * inv_z2[active]
+        )
+        d_uv_dq[active, 1, 2] = (
+            -intrinsics.fy * camera_points[active, 1] * inv_z2[active]
+        )
+
+        # d(q) / d(rvec) = -[R X]_x J_l(rvec)
+        d_q_dr = -_skew_matrices(rotated_points) @ left_jacs[camera_ids]
+
+        row_chunks = []
+        col_chunks = []
+        val_chunks = []
+
+        obs_idx = np.arange(obs_count, dtype=np.int64)
+        pixel_rows = np.column_stack((2 * obs_idx, 2 * obs_idx + 1))
+
+        def _append_3d_block(mask, col_offsets, jac_3x3):
+            if not np.any(mask):
+                return
+            sel_obs = obs_idx[mask]
+            sel_rows = pixel_rows[sel_obs]
+            sel_cols = col_offsets[mask]
+            d_uv_dp = d_uv_dq[mask] @ jac_3x3
+
+            # Pixel rows (2 x 3 per observation)
+            r_pix = np.repeat(sel_rows, 3, axis=1).ravel()
+            c_pix = np.tile(sel_cols[:, None] + np.arange(3), (1, 2)).ravel()
+            row_chunks.append(r_pix)
+            col_chunks.append(c_pix)
+            val_chunks.append(d_uv_dp.reshape(-1))
+
+            # Depth penalty row for clamped points
+            clamped_sub = clamped[mask]
+            if np.any(clamped_sub):
+                d_rows = 2 * obs_count + sel_obs[clamped_sub]
+                r_dep = np.repeat(d_rows, 3)
+                c_dep = (sel_cols[clamped_sub, None] + np.arange(3)).ravel()
+                v_dep = (100.0 * jac_3x3[clamped_sub, 2, :]).ravel()
+                row_chunks.append(r_dep)
+                col_chunks.append(c_dep)
+                val_chunks.append(v_dep)
+
+        # Point blocks (all observations)
+        point_cols = pose_parameter_count + point_ids * 3
+        _append_3d_block(
+            np.ones(obs_count, dtype=bool),
+            point_cols,
+            rotation_matrices[camera_ids],
+        )
+
+        # Cameras >= 2 blocks
+        cam2_mask = camera_ids >= 2
+        if np.any(cam2_mask):
+            cam_rot_cols = cam1_param_count + (camera_ids - 2) * 6
+            _append_3d_block(cam2_mask, cam_rot_cols, d_q_dr[cam2_mask])
+            eye3 = np.broadcast_to(
+                np.eye(3, dtype=np.float64),
+                (int(np.count_nonzero(cam2_mask)), 3, 3),
+            )
+            _append_3d_block(cam2_mask, cam_rot_cols + 3, eye3)
+
+        # Camera 1 block (when unfixed)
+        if not fix_second_camera:
+            cam1_mask = camera_ids == 1
+            if np.any(cam1_mask):
+                cam1_rot_cols = np.zeros(obs_count, dtype=np.int64)
+                _append_3d_block(cam1_mask, cam1_rot_cols, d_q_dr[cam1_mask])
+
+                w = t1_dir + t1_basis @ parameters[3:5]
+                w_norm = float(np.linalg.norm(w))
+                proj_mat = (t1_norm / w_norm) * (
+                    np.eye(3, dtype=np.float64) - np.outer(w, w) / (w_norm * w_norm)
+                )
+                d_t1_dab = proj_mat @ t1_basis  # (3, 2)
+
+                sel_obs = obs_idx[cam1_mask]
+                n1 = len(sel_obs)
+                d_uv_dab = d_uv_dq[cam1_mask] @ d_t1_dab[None, :, :]  # (n1, 2, 2)
+                r_pix = np.repeat(pixel_rows[sel_obs], 2, axis=1).ravel()
+                c_pix = np.tile(np.array([3, 4], dtype=np.int64), (n1, 2)).ravel()
+                row_chunks.append(r_pix)
+                col_chunks.append(c_pix)
+                val_chunks.append(d_uv_dab.reshape(-1))
+
+                clamped1 = clamped[cam1_mask]
+                if np.any(clamped1):
+                    d_rows = 2 * obs_count + sel_obs[clamped1]
+                    r_dep = np.repeat(d_rows, 2)
+                    c_dep = np.tile(np.array([3, 4], dtype=np.int64), len(d_rows))
+                    v_dep = np.tile(100.0 * d_t1_dab[2, :], len(d_rows))
+                    row_chunks.append(r_dep)
+                    col_chunks.append(c_dep)
+                    val_chunks.append(v_dep)
+
+        return coo_matrix(
+            (
+                np.concatenate(val_chunks),
+                (np.concatenate(row_chunks), np.concatenate(col_chunks)),
+            ),
+            shape=(obs_count * 3, total_params),
+        ).tocsr()
+
     def pixel_rmse(parameters):
         residuals = calculate_residuals(parameters)
         pixel_values = residuals[: len(observations) * 2]
@@ -288,18 +455,11 @@ def bundle_adjust(
 
     initial_rmse = pixel_rmse(x0)
 
-    sparsity = _build_jacobian_sparsity(
-        camera_count,
-        point_count,
-        camera_ids,
-        point_ids,
-    )
-
     try:
         optimized = least_squares(
             calculate_residuals,
             x0,
-            jac_sparsity=sparsity,
+            jac=calculate_jacobian,
             method="trf",
             tr_solver="lsmr",
             x_scale="jac",
@@ -535,62 +695,220 @@ def _sampson_inlier_mask(
     return np.isfinite(errors) & (errors <= threshold_px)
 
 
-def _add_triangulated_tracks(graph, intrinsics, poses, lookup, points_by_track):
-    for pair in graph.pairwise_matches:
-        a, b = pair.first_view, pair.second_view
+def _max_pairwise_parallax_deg(
+    point_3d: np.ndarray,
+    centers: np.ndarray,
+) -> float:
+    rays = point_3d[None, :] - centers
+    norms = np.linalg.norm(rays, axis=1)
+    if np.any(norms <= 1e-12):
+        return 0.0
+    unit_rays = rays / norms[:, None]
+    dots = np.clip(unit_rays @ unit_rays.T, -1.0, 1.0)
+    min_dot = float(np.min(dots))
+    return float(np.rad2deg(np.arccos(min_dot)))
 
-        if a not in poses or b not in poses or len(pair.matches) < 5:
+
+def _triangulate_track_multiview(
+    track: FeatureTrack,
+    poses: dict[int, tuple[np.ndarray, np.ndarray]],
+    features,
+    intrinsics: CameraIntrinsics,
+    *,
+    min_depth: float = 1e-6,
+    max_reprojection_error_px: float = 3.5,
+    min_parallax_degrees: float = 0.25,
+) -> np.ndarray | None:
+    obs_views = []
+    obs_rotations = []
+    obs_translations = []
+    obs_pixels = []
+    obs_centers = []
+
+    for obs in track.observations:
+        view = int(obs.view_index)
+        if view not in poses:
+            continue
+        r_mat, t_vec = poses[view]
+        t_flat = t_vec.reshape(3)
+        obs_views.append(view)
+        obs_rotations.append(r_mat)
+        obs_translations.append(t_flat)
+        obs_pixels.append(_keypoint_xy(features, view, obs.keypoint_index))
+        obs_centers.append(-r_mat.T @ t_flat)
+
+    view_count = len(obs_views)
+    if view_count < 2:
+        return None
+
+    rotations_arr = np.asarray(obs_rotations, dtype=np.float64)
+    translations_arr = np.asarray(obs_translations, dtype=np.float64)
+    pixels_arr = np.asarray(obs_pixels, dtype=np.float64)
+    centers_arr = np.asarray(obs_centers, dtype=np.float64)
+
+    result = triangulate_multiview_point(
+        rotations_arr,
+        translations_arr,
+        pixels_arr,
+        intrinsics,
+        min_depth=min_depth,
+    )
+    if result is not None:
+        point, errors = result
+        if np.all(errors <= max_reprojection_error_px):
+            if (
+                _max_pairwise_parallax_deg(point, centers_arr)
+                >= min_parallax_degrees
+            ):
+                return point
+
+    if view_count < 3:
+        return None
+
+    # A single bad observation in a 3+ view track can corrupt all-view DLT;
+    # find the largest geometrically consistent view subset via pair consensus.
+    max_search_views = min(view_count, 8)
+    best_inliers = None
+    best_mean_err = float("inf")
+    fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy
+
+    for i, j in combinations(range(max_search_views), 2):
+        pair_res = triangulate_multiview_point(
+            rotations_arr[[i, j]],
+            translations_arr[[i, j]],
+            pixels_arr[[i, j]],
+            intrinsics,
+            min_depth=min_depth,
+        )
+        if pair_res is None:
+            continue
+        cand_pt, pair_err = pair_res
+        if np.any(pair_err > max_reprojection_error_px):
             continue
 
-        try:
-            xy_a, xy_b = matched_keypoint_coordinates(
-                graph.features[a],
-                graph.features[b],
-                pair.matches,
-            )
+        cam_pts = np.einsum("nij,j->ni", rotations_arr, cand_pt) + translations_arr
+        z = cam_pts[:, 2]
+        valid_z = np.isfinite(cam_pts).all(axis=1) & (z > min_depth)
+        inliers = []
+        errs = []
+        for idx in np.flatnonzero(valid_z):
+            px = fx * (cam_pts[idx, 0] / z[idx]) + cx
+            py = fy * (cam_pts[idx, 1] / z[idx]) + cy
+            err = float(np.hypot(px - pixels_arr[idx, 0], py - pixels_arr[idx, 1]))
+            if err <= max_reprojection_error_px:
+                inliers.append(int(idx))
+                errs.append(err)
 
-            relative = _relative_pose(poses[a], poses[b], len(pair.matches))
-            geometric_mask = _sampson_inlier_mask(
-                xy_a,
-                xy_b,
-                relative,
-                intrinsics,
-                threshold_px=2.5,
-            )
+        if len(inliers) >= 2:
+            mean_err = float(np.mean(errs))
+            if best_inliers is None or (len(inliers), -mean_err) > (
+                len(best_inliers),
+                -best_mean_err,
+            ):
+                best_inliers = inliers
+                best_mean_err = mean_err
 
-            if np.count_nonzero(geometric_mask) < 5:
+    if best_inliers is None:
+        return None
+
+    subset_res = triangulate_multiview_point(
+        rotations_arr[best_inliers],
+        translations_arr[best_inliers],
+        pixels_arr[best_inliers],
+        intrinsics,
+        min_depth=min_depth,
+    )
+    if subset_res is None:
+        return None
+
+    point, errors = subset_res
+    if np.any(errors > max_reprojection_error_px):
+        return None
+    if (
+        _max_pairwise_parallax_deg(point, centers_arr[best_inliers])
+        < min_parallax_degrees
+    ):
+        return None
+    return point
+
+
+def _add_triangulated_tracks(
+    graph,
+    intrinsics,
+    poses,
+    lookup,
+    points_by_track,
+    *,
+    target_view: int | None = None,
+):
+    if target_view is None:
+        for pair in graph.pairwise_matches:
+            a, b = pair.first_view, pair.second_view
+            if a not in poses or b not in poses or len(pair.matches) < 5:
                 continue
 
-            relative = RelativePose(
-                rotation=relative.rotation,
-                translation=relative.translation,
-                essential_matrix=relative.essential_matrix,
-                inlier_mask=geometric_mask,
-            )
+            try:
+                xy_a, xy_b = matched_keypoint_coordinates(
+                    graph.features[a],
+                    graph.features[b],
+                    pair.matches,
+                )
+                relative = _relative_pose(poses[a], poses[b], len(pair.matches))
+                geometric_mask = _sampson_inlier_mask(
+                    xy_a,
+                    xy_b,
+                    relative,
+                    intrinsics,
+                    threshold_px=2.5,
+                )
+                if np.count_nonzero(geometric_mask) < 5:
+                    continue
 
-            result = triangulate_points(
-                xy_a,
-                xy_b,
-                intrinsics,
-                relative,
-                max_reprojection_error_px=3.0,
-                min_parallax_degrees=0.25,
-            )
-            indexed = _indexed_points(result, len(pair.matches))
-        except (ReconstructionError, cv2.error, np.linalg.LinAlgError):
+                relative = RelativePose(
+                    rotation=relative.rotation,
+                    translation=relative.translation,
+                    essential_matrix=relative.essential_matrix,
+                    inlier_mask=geometric_mask,
+                )
+                result = triangulate_points(
+                    xy_a,
+                    xy_b,
+                    intrinsics,
+                    relative,
+                    max_reprojection_error_px=3.0,
+                    min_parallax_degrees=0.25,
+                )
+                indexed = _indexed_points(result, len(pair.matches))
+            except (ReconstructionError, cv2.error, np.linalg.LinAlgError):
+                continue
+
+            track_ids = _match_tracks(pair, lookup)
+            rotation_a, translation_a = poses[a]
+            for match_index, point_camera_a in indexed.items():
+                track_id = track_ids[match_index]
+                if track_id is None or track_id in points_by_track:
+                    continue
+                world_point = (point_camera_a - translation_a.reshape(3)) @ rotation_a
+                if np.isfinite(world_point).all():
+                    points_by_track[track_id] = world_point.copy()
+        return
+
+    for track_id, track in enumerate(graph.tracks):
+        views_in_track = [int(obs.view_index) for obs in track.observations]
+        if target_view not in views_in_track:
+            continue
+        registered_views = [v for v in views_in_track if v in poses]
+        if len(registered_views) < 2:
             continue
 
-        track_ids = _match_tracks(pair, lookup)
-        rotation_a, translation_a = poses[a]
-
-        for match_index, point_camera_a in indexed.items():
-            track_id = track_ids[match_index]
-            if track_id is None or track_id in points_by_track:
-                continue
-
-            world_point = (point_camera_a - translation_a.reshape(3)) @ rotation_a
-            if np.isfinite(world_point).all():
-                points_by_track[track_id] = world_point.copy()
+        point = _triangulate_track_multiview(
+            track,
+            poses,
+            graph.features,
+            intrinsics,
+        )
+        if point is not None and np.isfinite(point).all():
+            points_by_track[track_id] = point.copy()
 
 
 def _is_valid_observation(
@@ -613,16 +931,51 @@ def _is_valid_observation(
     return bool(np.isfinite(error) and error <= max_reprojection_error_px)
 
 
-def _seed_pair(graph, intrinsics, lookup, min_matches, min_points):
+def _pair_median_parallax_deg(
+    points_cam_a: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+) -> float:
+    if len(points_cam_a) == 0:
+        return 0.0
+    cam_b_center = (-rotation.T @ translation.reshape(3)).reshape(1, 3)
+    ray_a = points_cam_a
+    ray_b = points_cam_a - cam_b_center
+    norm_prod = np.linalg.norm(ray_a, axis=1) * np.linalg.norm(ray_b, axis=1)
+    valid = norm_prod > 1e-12
+    if not np.any(valid):
+        return 0.0
+    cosines = np.sum(ray_a[valid] * ray_b[valid], axis=1) / norm_prod[valid]
+    angles = np.rad2deg(np.arccos(np.clip(cosines, -1.0, 1.0)))
+    return float(np.median(angles))
+
+
+def _seed_pair(
+    graph,
+    intrinsics,
+    lookup,
+    min_matches,
+    min_points,
+    *,
+    refine_two_view: bool = True,
+):
     candidates = sorted(
         graph.pairwise_matches,
         key=lambda pair: len(pair.matches),
         reverse=True,
     )
 
+    best_choice = None
+    best_rank = (-1, -1.0)
+    max_candidates_to_evaluate = 24
+    evaluated = 0
+
     for pair in candidates:
         if len(pair.matches) < min_matches:
             continue
+        if evaluated >= max_candidates_to_evaluate and best_choice is not None:
+            break
+        evaluated += 1
 
         try:
             xy_a, xy_b = matched_keypoint_coordinates(
@@ -654,19 +1007,160 @@ def _seed_pair(graph, intrinsics, lookup, min_matches, min_points):
         if np.linalg.norm(translation) < 1e-8:
             continue
 
-        return (
-            (pair.first_view, pair.second_view),
-            {
-                pair.first_view: (np.eye(3), np.zeros((3, 1))),
-                pair.second_view: (rotation.copy(), translation.copy()),
-            },
-            points,
+        median_parallax = _pair_median_parallax_deg(
+            np.asarray(list(points.values()), dtype=np.float64),
+            rotation,
+            translation,
+        )
+        # Prefer well-conditioned baselines (>= 2 deg parallax) over near-zero
+        # baseline pairs even if the latter have slightly more raw matches.
+        tier = 1 if median_parallax >= 2.0 else 0
+        parallax_weight = (
+            min(median_parallax / 6.0, 1.5)
+            if tier == 1
+            else min(median_parallax / 2.0, 1.0)
+        )
+        score = float(len(points)) * max(parallax_weight, 1e-3)
+        rank = (tier, score)
+
+        if rank > best_rank:
+            best_rank = rank
+            best_choice = (
+                (pair.first_view, pair.second_view),
+                {
+                    pair.first_view: (np.eye(3), np.zeros((3, 1))),
+                    pair.second_view: (rotation.copy(), translation.copy()),
+                },
+                points,
+            )
+
+    if best_choice is None:
+        raise ReconstructionError(
+            "No suitable starting camera pair found. Use photographs with "
+            "more overlapping visual features."
         )
 
-    raise ReconstructionError(
-        "No suitable starting camera pair found. Use photographs with "
-        "more overlapping visual features."
+    seed, poses, points = best_choice
+    if refine_two_view and len(points) >= 6:
+        try:
+            ba_res, selected_ids = _run_pose_and_point_ba(
+                seed,
+                poses,
+                points,
+                graph,
+                intrinsics,
+                max_observation_error_px=5.0,
+                max_nfev=60,
+            )
+            if ba_res is not None and ba_res.final_rmse <= ba_res.initial_rmse:
+                r1, _ = cv2.Rodrigues(ba_res.camera_rotations[1])
+                poses[seed[1]] = (
+                    r1.copy(),
+                    ba_res.camera_translations[1].reshape(3, 1).copy(),
+                )
+                for idx, track_id in enumerate(selected_ids):
+                    points[int(track_id)] = ba_res.points_3d[idx].copy()
+        except ReconstructionError:
+            pass
+
+    return seed, poses, points
+
+
+def _collect_ba_problem(
+    order,
+    poses,
+    points_by_track,
+    graph,
+    intrinsics,
+    *,
+    max_observation_error_px: float,
+):
+    camera_index = {view: index for index, view in enumerate(order)}
+    rotations = np.vstack(
+        [cv2.Rodrigues(poses[view][0])[0].reshape(3) for view in order]
     )
+    translations = np.vstack([poses[view][1].reshape(3) for view in order])
+
+    selected_ids, point_list = [], []
+    camera_indices, point_indices, pixels = [], [], []
+
+    for track_id in sorted(points_by_track):
+        track_point = points_by_track[track_id]
+        observations = []
+        for obs in graph.tracks[track_id].observations:
+            if obs.view_index in camera_index:
+                xy = _keypoint_xy(graph.features, obs.view_index, obs.keypoint_index)
+                if _is_valid_observation(
+                    track_point,
+                    poses[obs.view_index],
+                    intrinsics,
+                    xy,
+                    max_reprojection_error_px=max_observation_error_px,
+                ):
+                    observations.append((camera_index[obs.view_index], xy))
+
+        if len(observations) < 2:
+            continue
+
+        selected_ids.append(track_id)
+        point_list.append(track_point)
+        for cam, xy in observations:
+            camera_indices.append(cam)
+            point_indices.append(len(point_list) - 1)
+            pixels.append(xy)
+
+    return (
+        rotations,
+        translations,
+        np.asarray(point_list, dtype=np.float64),
+        np.asarray(selected_ids, dtype=np.int64),
+        np.asarray(camera_indices, dtype=np.int64),
+        np.asarray(point_indices, dtype=np.int64),
+        np.asarray(pixels, dtype=np.float64),
+    )
+
+
+def _run_pose_and_point_ba(
+    order,
+    poses,
+    points_by_track,
+    graph,
+    intrinsics,
+    *,
+    max_observation_error_px: float = 5.0,
+    max_nfev: int = 80,
+):
+    (
+        rotations,
+        translations,
+        points_3d,
+        selected_ids,
+        camera_indices,
+        point_indices,
+        pixels,
+    ) = _collect_ba_problem(
+        order,
+        poses,
+        points_by_track,
+        graph,
+        intrinsics,
+        max_observation_error_px=max_observation_error_px,
+    )
+    if len(points_3d) < 6 or len(pixels) < 4:
+        return None, selected_ids
+
+    ba_result = bundle_adjust(
+        rotations,
+        translations,
+        points_3d,
+        camera_indices,
+        point_indices,
+        pixels,
+        intrinsics,
+        max_nfev=max_nfev,
+        fix_second_camera=False,
+    )
+    return ba_result, selected_ids
 
 
 def reconstruct_image_set(
@@ -684,6 +1178,7 @@ def reconstruct_image_set(
     run_bundle_adjustment=True,
     bundle_adjustment_max_nfev=200,
     require_all_cameras=False,
+    masks=None,
 ):
     images = tuple(images)
 
@@ -727,6 +1222,7 @@ def reconstruct_image_set(
         ratio_threshold=ratio_threshold,
         pairing_strategy=pairing_strategy,
         min_track_length=min_track_length,
+        masks=masks,
     )
 
     if not graph.pairwise_matches:
@@ -734,7 +1230,12 @@ def reconstruct_image_set(
 
     lookup = _track_lookup(graph.tracks)
     seed, poses, points_by_track = _seed_pair(
-        graph, intrinsics, lookup, min_pair_matches, min_seed_points
+        graph,
+        intrinsics,
+        lookup,
+        min_pair_matches,
+        min_seed_points,
+        refine_two_view=run_bundle_adjustment,
     )
 
     matrix = _camera_matrix(intrinsics)
@@ -767,13 +1268,14 @@ def reconstruct_image_set(
 
         candidates.sort(key=lambda item: len(item[1]), reverse=True)
 
-        registered = False
+        registered_view = None
         for view, objects, pixels in candidates:
             try:
                 result = register_camera_pnp(
                     np.asarray(objects),
                     np.asarray(pixels),
                     matrix,
+                    reprojection_error=3.5,
                     min_inliers=pnp_min_inliers,
                 )
             except ReconstructionError:
@@ -783,10 +1285,10 @@ def reconstruct_image_set(
                 result.rotation_matrix.copy(),
                 result.translation_vector.copy(),
             )
-            registered = True
+            registered_view = view
             break
 
-        if not registered:
+        if registered_view is None:
             if require_all_cameras:
                 raise ReconstructionError(
                     "Could not register every camera. A remaining image needs "
@@ -794,52 +1296,78 @@ def reconstruct_image_set(
                 )
             break
 
-        _add_triangulated_tracks(graph, intrinsics, poses, lookup, points_by_track)
+        _add_triangulated_tracks(
+            graph,
+            intrinsics,
+            poses,
+            lookup,
+            points_by_track,
+            target_view=registered_view,
+        )
+
+        if (
+            run_bundle_adjustment
+            and len(poses) >= 3
+            and len(points_by_track) >= 6
+            and (len(poses) <= 8 or len(poses) % 2 == 0)
+        ):
+            cur_order = (
+                seed[0],
+                seed[1],
+                *(
+                    v
+                    for v in range(len(images))
+                    if v in poses and v not in seed
+                ),
+            )
+            try:
+                inc_ba, inc_ids = _run_pose_and_point_ba(
+                    cur_order,
+                    poses,
+                    points_by_track,
+                    graph,
+                    intrinsics,
+                    max_observation_error_px=6.0,
+                    max_nfev=60,
+                )
+                if inc_ba is not None and inc_ba.final_rmse <= inc_ba.initial_rmse:
+                    for idx, view_id in enumerate(cur_order):
+                        r_mat, _ = cv2.Rodrigues(inc_ba.camera_rotations[idx])
+                        poses[view_id] = (
+                            r_mat.copy(),
+                            inc_ba.camera_translations[idx].reshape(3, 1).copy(),
+                        )
+                    for idx, track_id in enumerate(inc_ids):
+                        points_by_track[int(track_id)] = inc_ba.points_3d[idx].copy()
+            except ReconstructionError:
+                pass
 
     order = (
         seed[0],
         seed[1],
         *(view for view in range(len(images)) if view in poses and view not in seed),
     )
-    camera_index = {view: index for index, view in enumerate(order)}
 
-    rotations = np.vstack(
-        [cv2.Rodrigues(poses[view][0])[0].reshape(3) for view in order]
+    (
+        rotations,
+        translations,
+        points_3d,
+        selected_ids,
+        camera_indices,
+        point_indices,
+        pixels,
+    ) = _collect_ba_problem(
+        order,
+        poses,
+        points_by_track,
+        graph,
+        intrinsics,
+        max_observation_error_px=5.0,
     )
-    translations = np.vstack([poses[view][1].reshape(3) for view in order])
 
-    selected_ids, point_list = [], []
-    camera_indices, point_indices, pixels = [], [], []
-
-    for track_id in sorted(points_by_track):
-        track_point = points_by_track[track_id]
-        observations = []
-        for obs in graph.tracks[track_id].observations:
-            if obs.view_index in camera_index:
-                xy = _keypoint_xy(graph.features, obs.view_index, obs.keypoint_index)
-                if _is_valid_observation(
-                    track_point,
-                    poses[obs.view_index],
-                    intrinsics,
-                    xy,
-                ):
-                    observations.append((camera_index[obs.view_index], xy))
-
-        if len(observations) < 2:
-            continue
-
-        selected_ids.append(track_id)
-        point_list.append(track_point)
-        for cam, xy in observations:
-            camera_indices.append(cam)
-            point_indices.append(len(point_list) - 1)
-            pixels.append(xy)
-
-    if not point_list:
+    if len(points_3d) == 0:
         raise ReconstructionError("No valid multi-view 3D tracks were produced.")
 
-    points_3d = np.asarray(point_list, dtype=np.float64)
-    selected_ids = np.asarray(selected_ids, dtype=np.int64)
     ba_result = None
 
     if run_bundle_adjustment:
@@ -852,19 +1380,67 @@ def reconstruct_image_set(
             rotations,
             translations,
             points_3d,
-            np.asarray(camera_indices, dtype=np.int64),
-            np.asarray(point_indices, dtype=np.int64),
-            np.asarray(pixels, dtype=np.float64),
+            camera_indices,
+            point_indices,
+            pixels,
             intrinsics,
             max_nfev=bundle_adjustment_max_nfev,
+            fix_second_camera=False,
         )
 
-        if not ba_result.success:
+        if not ba_result.success and ba_result.final_rmse > ba_result.initial_rmse:
             raise ReconstructionError("Bundle adjustment failed: " + ba_result.message)
 
         rotations = ba_result.camera_rotations
         translations = ba_result.camera_translations
         points_3d = ba_result.points_3d
+
+        # Post-BA outlier pruning and polish pass.
+        refined_poses = {}
+        for idx, view in enumerate(order):
+            r_mat, _ = cv2.Rodrigues(rotations[idx])
+            refined_poses[view] = (
+                r_mat.copy(),
+                translations[idx].reshape(3, 1).copy(),
+            )
+        refined_points = {
+            int(track_id): points_3d[idx].copy()
+            for idx, track_id in enumerate(selected_ids)
+        }
+        (
+            p_rot,
+            p_trans,
+            p_pts,
+            p_ids,
+            p_cam_ids,
+            p_pt_ids,
+            p_pixels,
+        ) = _collect_ba_problem(
+            order,
+            refined_poses,
+            refined_points,
+            graph,
+            intrinsics,
+            max_observation_error_px=3.5,
+        )
+        if len(p_pts) >= 6 and len(p_pixels) < len(pixels):
+            polish = bundle_adjust(
+                p_rot,
+                p_trans,
+                p_pts,
+                p_cam_ids,
+                p_pt_ids,
+                p_pixels,
+                intrinsics,
+                max_nfev=min(bundle_adjustment_max_nfev, 80),
+                fix_second_camera=False,
+            )
+            if polish.success or polish.final_rmse <= polish.initial_rmse:
+                ba_result = polish
+                rotations = polish.camera_rotations
+                translations = polish.camera_translations
+                points_3d = polish.points_3d
+                selected_ids = p_ids
 
     return MultiViewReconstructionResult(
         seed_pair=seed,

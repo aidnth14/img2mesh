@@ -96,6 +96,16 @@ def extract_features(
 
     if not keypoints_tuple:
         descriptors = None
+    elif (
+        normalized_method == "sift"
+        and descriptors is not None
+        and len(descriptors) > 0
+    ):
+        # RootSIFT normalization improves descriptor matching under L2 distance.
+        desc = descriptors.astype(np.float32, copy=True)
+        l1_norm = np.sum(np.abs(desc), axis=1, keepdims=True)
+        desc /= np.maximum(l1_norm, 1e-7)
+        descriptors = np.sqrt(np.maximum(desc, 0.0))
 
     return FeatureSet(
         method=normalized_method,
@@ -110,6 +120,7 @@ def match_features(
     second: FeatureSet,
     *,
     ratio_threshold: float = 0.75,
+    cross_check: bool = True,
 ) -> tuple:
     if not isinstance(first, FeatureSet) or not isinstance(second, FeatureSet):
         raise InputError("match_features expects two FeatureSet instances.")
@@ -126,6 +137,9 @@ def match_features(
             "Ratio threshold must be greater than 0 and less than 1."
         )
 
+    if not isinstance(cross_check, bool):
+        raise ConfigurationError("cross_check must be True or False.")
+
     if first.descriptors is None or second.descriptors is None:
         return ()
 
@@ -141,6 +155,20 @@ def match_features(
         for pair in candidate_pairs
         if len(pair) == 2 and pair[0].distance < ratio_threshold * pair[1].distance
     ]
+
+    if cross_check and good_matches:
+        reverse_pairs = matcher.knnMatch(second.descriptors, first.descriptors, k=2)
+        reverse_best = {
+            pair[0].queryIdx: pair[0].trainIdx
+            for pair in reverse_pairs
+            if len(pair) == 2 and pair[0].distance < ratio_threshold * pair[1].distance
+        }
+        good_matches = [
+            match
+            for match in good_matches
+            if reverse_best.get(match.trainIdx) == match.queryIdx
+        ]
+
     good_matches.sort(key=lambda match: match.distance)
 
     return tuple(good_matches)

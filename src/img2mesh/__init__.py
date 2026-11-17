@@ -28,6 +28,7 @@ from .geometry import (
     estimate_relative_pose,
     matched_keypoint_coordinates,
     register_camera_pnp,
+    triangulate_multiview_point,
     triangulate_points,
 )
 from .image import (
@@ -43,15 +44,23 @@ from .io import (
     export_mesh,
     export_obj,
     export_stl,
+    extract_exif_focal_length,
     load_image,
     validate_image_path,
 )
-from .mesh import MeshResult, clean_point_cloud, generate_mesh
+from .mesh import MeshResult, clean_point_cloud, estimate_alpha, generate_mesh
 from .pipeline import (
     BundleAdjustmentResult,
     MultiViewReconstructionResult,
     bundle_adjust,
     reconstruct_image_set,
+)
+from .silhouette import (
+    VisualHullResult,
+    extract_foreground_mask,
+    marching_tetrahedra,
+    rasterize_mesh_silhouette,
+    reconstruct_visual_hull,
 )
 
 __all__ = [
@@ -78,26 +87,34 @@ __all__ = [
     "RelativePose",
     "SUPPORTED_IMAGE_EXTENSIONS",
     "TriangulationResult",
+    "VisualHullResult",
     "analyze_image_set",
     "build_feature_tracks",
     "bundle_adjust",
     "clean_mask",
     "clean_point_cloud",
+    "estimate_alpha",
     "estimate_relative_pose",
     "export_glb",
     "export_mesh",
     "export_obj",
     "export_stl",
+    "extract_exif_focal_length",
     "extract_features",
+    "extract_foreground_mask",
     "generate_mesh",
     "largest_component",
     "load_image",
+    "marching_tetrahedra",
     "match_features",
     "matched_keypoint_coordinates",
     "preprocess_image",
+    "rasterize_mesh_silhouette",
     "reconstruct_image_set",
+    "reconstruct_visual_hull",
     "register_camera_pnp",
     "segment_foreground",
+    "triangulate_multiview_point",
     "triangulate_points",
     "validate_image_path",
 ]

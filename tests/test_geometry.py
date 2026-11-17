@@ -10,6 +10,7 @@ from img2mesh.geometry import (
     estimate_relative_pose,
     matched_keypoint_coordinates,
     register_camera_pnp,
+    triangulate_multiview_point,
     triangulate_points,
 )
 from img2mesh.pipeline import _relative_pose, _sampson_inlier_mask
@@ -707,3 +708,45 @@ def test_rejects_invalid_registration_settings():
 
     with pytest.raises(ReconstructionError, match="refine"):
         register_camera_pnp(objects, images, matrix, refine="yes")
+
+
+def test_multiview_triangulation_recovers_point_with_noise():
+    intrinsics = CameraIntrinsics.from_focal_length(640, 480, 700.0)
+    gt_point = np.array([0.35, -0.25, 5.2], dtype=np.float64)
+    rotations = np.array(
+        [
+            np.eye(3),
+            cv2.Rodrigues(np.array([0.0, 0.12, 0.0]))[0],
+            cv2.Rodrigues(np.array([0.05, -0.1, 0.02]))[0],
+            cv2.Rodrigues(np.array([-0.04, 0.05, -0.02]))[0],
+        ],
+        dtype=np.float64,
+    )
+    translations = np.array(
+        [
+            [0.0, 0.0, 0.0],
+            [-0.8, 0.0, 0.05],
+            [0.7, 0.1, 0.1],
+            [0.1, -0.6, 0.05],
+        ],
+        dtype=np.float64,
+    )
+    pixels = []
+    for r_mat, t_vec in zip(rotations, translations, strict=True):
+        cam = r_mat @ gt_point + t_vec
+        pixels.append(
+            [
+                intrinsics.fx * cam[0] / cam[2] + intrinsics.cx,
+                intrinsics.fy * cam[1] / cam[2] + intrinsics.cy,
+            ]
+        )
+    rng = np.random.default_rng(7)
+    noisy_pixels = np.asarray(pixels, dtype=np.float64) + rng.normal(0.0, 0.25, (4, 2))
+
+    result = triangulate_multiview_point(
+        rotations, translations, noisy_pixels, intrinsics
+    )
+    assert result is not None
+    est_point, errors = result
+    assert np.linalg.norm(est_point - gt_point) < 0.03
+    assert np.all(errors < 1.0)

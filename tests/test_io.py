@@ -17,6 +17,7 @@ from img2mesh.io import (
     export_mesh,
     export_obj,
     export_stl,
+    extract_exif_focal_length,
     load_image,
 )
 from img2mesh.mesh import MeshResult
@@ -306,3 +307,18 @@ def test_export_glb_handles_cancelling_vertex_normals(tmp_path):
     path = export_glb(mesh, tmp_path / "double_sided.glb")
     assert path.is_file()
     assert path.stat().st_size > 0
+
+
+def test_extract_exif_focal_length_and_scaling(tmp_path):
+    path = tmp_path / "photo.jpg"
+    img = Image.new("RGB", (400, 300), color="gray")
+    exif = Image.Exif()
+    exif[0xA405] = 28  # FocalLengthIn35mmFilm
+    img.save(path, format="JPEG", exif=exif.tobytes())
+
+    focal = extract_exif_focal_length(path)
+    assert focal is not None
+    assert focal == pytest.approx((28.0 / 36.0) * 400.0)
+
+    scaled = extract_exif_focal_length(path, target_size=(200, 150))
+    assert scaled == pytest.approx((28.0 / 36.0) * 200.0)

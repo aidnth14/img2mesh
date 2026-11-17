@@ -308,3 +308,52 @@ def test_cli_applies_preprocessing_and_focal_length(tmp_path, monkeypatch):
     assert intrinsics.image_width == 60
     assert intrinsics.image_height == 40
     assert intrinsics.fx == 500.0
+
+
+def test_cli_auto_alpha_and_segment_foreground(tmp_path, monkeypatch):
+    Image.new("RGB", (64, 64), (10, 10, 10)).save(tmp_path / "one.png")
+    Image.new("RGB", (64, 64), (15, 15, 15)).save(tmp_path / "two.png")
+    output = tmp_path / "model.glb"
+
+    captured = {}
+
+    def fake_reconstruct(images, **kwargs):
+        captured["recon"] = kwargs
+        return SimpleNamespace(
+            camera_count=2,
+            point_count=10,
+            points_3d=np.ones((8, 3), dtype=np.float64),
+        )
+
+    def fake_mesh(points, **kwargs):
+        captured["mesh"] = kwargs
+        return SimpleNamespace(vertex_count=8, face_count=12)
+
+    monkeypatch.setattr(cli, "reconstruct_image_set", fake_reconstruct)
+    monkeypatch.setattr(cli, "generate_mesh", fake_mesh)
+    monkeypatch.setattr(
+        cli,
+        "export_mesh",
+        lambda mesh, path, **kwargs: Path(path).write_bytes(b"glb") or Path(path),
+    )
+
+    code = cli.main(
+        [
+            str(tmp_path),
+            str(output),
+            "--auto-alpha",
+            "--segment-foreground",
+            "otsu",
+        ]
+    )
+    assert code == cli.EXIT_SUCCESS
+    assert captured["mesh"]["auto_alpha"] is True
+    assert captured["mesh"]["alpha"] is None
+
+
+def test_cli_rejects_alpha_and_auto_alpha_together(tmp_path):
+    make_image(tmp_path / "one.png")
+    make_image(tmp_path / "two.png")
+    output = tmp_path / "model.glb"
+    with pytest.raises(SystemExit):
+        cli.main([str(tmp_path), str(output), "--alpha", "1.0", "--auto-alpha"])

@@ -16,12 +16,14 @@ from img2mesh.features import (
     PairwiseMatches,
 )
 from img2mesh.geometry import CameraIntrinsics, TriangulationResult
-from img2mesh.mesh import clean_point_cloud, generate_mesh
+from img2mesh.io import export_glb
+from img2mesh.mesh import clean_point_cloud, estimate_alpha, generate_mesh
 from img2mesh.pipeline import (
     _camera_matrix,
     _indexed_points,
     _is_valid_observation,
     _make_intrinsics,
+    _triangulate_track_multiview,
     bundle_adjust,
     reconstruct_image_set,
 )
@@ -516,3 +518,176 @@ def test_rejects_invalid_clean_and_std_ratio():
 
     with pytest.raises(ReconstructionError, match="std_ratio"):
         clean_point_cloud(cube_points(), std_ratio=True)
+
+
+def test_bundle_adjustment_unfixed_second_camera_preserves_baseline_norm():
+    problem = make_ba_problem()
+    init_r = problem["initial_rotations"].copy()
+    init_t = problem["initial_translations"].copy()
+    init_r[1] += np.array([0.015, -0.02, 0.01])
+    target_norm = np.linalg.norm(init_t[1])
+    init_t[1] += np.array([0.0, 0.04, -0.03])
+    init_t[1] = init_t[1] / np.linalg.norm(init_t[1]) * target_norm
+
+    result = bundle_adjust(
+        init_r,
+        init_t,
+        problem["initial_points"],
+        problem["camera_indices"],
+        problem["point_indices"],
+        problem["observations"],
+        problem["camera"],
+        fix_second_camera=False,
+    )
+
+    assert result.success
+    assert result.final_rmse < 1e-4
+    np.testing.assert_allclose(result.camera_rotations[0], 0.0)
+    np.testing.assert_allclose(result.camera_translations[0], 0.0)
+    assert np.linalg.norm(result.camera_translations[1]) == pytest.approx(target_norm)
+
+
+def test_multiview_track_triangulation_salvages_single_outlier_view():
+    intrinsics = CameraIntrinsics.from_focal_length(640, 480, 700.0)
+    gt_point = np.array([0.4, -0.3, 5.0], dtype=np.float64)
+    poses = {
+        0: (np.eye(3), np.zeros((3, 1))),
+        1: (
+            cv2.Rodrigues(np.array([0.0, 0.1, 0.0]))[0],
+            np.array([[-0.8], [0.0], [0.05]]),
+        ),
+        2: (
+            cv2.Rodrigues(np.array([0.04, -0.1, 0.01]))[0],
+            np.array([[0.7], [0.05], [0.1]]),
+        ),
+        3: (
+            cv2.Rodrigues(np.array([-0.03, 0.05, -0.02]))[0],
+            np.array([[0.1], [-0.6], [0.05]]),
+        ),
+    }
+
+    kps = []
+    for view in range(4):
+        r_mat, t_vec = poses[view]
+        cam = (r_mat @ gt_point.reshape(3, 1) + t_vec).reshape(3)
+        u = intrinsics.fx * cam[0] / cam[2] + intrinsics.cx
+        v = intrinsics.fy * cam[1] / cam[2] + intrinsics.cy
+        if view == 2:
+            u += 90.0
+            v -= 70.0
+        kps.append(
+            FeatureSet(
+                method="orb",
+                keypoints=(cv2.KeyPoint(float(u), float(v), 1.0),),
+                descriptors=None,
+                image_size=(640, 480),
+            )
+        )
+
+    track = FeatureTrack(tuple(FeatureObservation(v, 0) for v in range(4)))
+    est = _triangulate_track_multiview(track, poses, tuple(kps), intrinsics)
+    assert est is not None
+    assert np.linalg.norm(est - gt_point) < 1e-4
+
+
+def test_end_to_end_rendered_multiview_accuracy_and_auto_alpha_mesh(tmp_path):
+    width, height = 640, 480
+    intrinsics = CameraIntrinsics.from_focal_length(width, height, 700.0)
+    rng = np.random.default_rng(123)
+    tex = rng.integers(0, 256, (256, 256, 3), dtype=np.uint8)
+    tex = cv2.GaussianBlur(tex, (3, 3), 0.7)
+    for i in range(0, 256, 32):
+        cv2.rectangle(tex, (i, i), (i + 16, i + 16), (255, 220, 100), -1)
+        cv2.circle(tex, (255 - i, i), 6, (40, 200, 255), -1)
+
+    quads = [
+        np.array(
+            [[-1.0, -0.8, 4.2], [0.2, -0.8, 4.2], [0.2, 0.8, 4.2], [-1.0, 0.8, 4.2]]
+        ),
+        np.array(
+            [[0.2, -0.8, 4.2], [0.2, -0.8, 5.4], [0.2, 0.8, 5.4], [0.2, 0.8, 4.2]]
+        ),
+        np.array(
+            [[0.2, -0.8, 5.4], [1.4, -0.8, 5.4], [1.4, 0.8, 5.4], [0.2, 0.8, 5.4]]
+        ),
+        np.array(
+            [[-1.0, -0.8, 4.2], [-1.0, 0.8, 4.2], [-1.0, 0.8, 5.4], [-1.0, -0.8, 5.4]]
+        ),
+    ]
+    cam_positions = [
+        np.array([0.0, 0.0, 0.0]),
+        np.array([0.02, 0.0, 0.0]),  # Near-zero baseline trap with view 0
+        np.array([0.7, 0.05, 0.1]),
+        np.array([1.3, -0.05, 0.25]),
+        np.array([-0.6, 0.08, 0.15]),
+    ]
+    target = np.array([0.1, 0.0, 4.8])
+    images, poses_gt = [], []
+    src_pts = np.array([[0, 0], [255, 0], [255, 255], [0, 255]], dtype=np.float32)
+
+    for pos in cam_positions:
+        fwd = target - pos
+        fwd /= np.linalg.norm(fwd)
+        down = np.array([0.0, 1.0, 0.0])
+        right = np.cross(down, fwd)
+        right /= np.linalg.norm(right)
+        down_cam = np.cross(fwd, right)
+        r_mat = np.column_stack([right, down_cam, fwd]).T
+        t_vec = (-r_mat @ pos).reshape(3, 1)
+        poses_gt.append((r_mat, t_vec))
+
+        canvas = np.full((height, width, 3), 20, dtype=np.uint8)
+        quads_sorted = sorted(
+            quads,
+            key=lambda q: np.mean((r_mat @ q.T + t_vec)[2]),
+            reverse=True,
+        )
+        for q in quads_sorted:
+            cam_q = (r_mat @ q.T + t_vec).T
+            proj = (intrinsics.matrix @ cam_q.T).T
+            dst_pts = (proj[:, :2] / proj[:, 2:3]).astype(np.float32)
+            h_mat, _ = cv2.findHomography(src_pts, dst_pts)
+            warped = cv2.warpPerspective(tex, h_mat, (width, height))
+            mask = np.zeros((height, width), dtype=np.uint8)
+            cv2.fillConvexPoly(mask, dst_pts.astype(np.int32), 255)
+            canvas[mask > 0] = warped[mask > 0]
+        images.append(Image.fromarray(canvas))
+
+    result = reconstruct_image_set(images, intrinsics=intrinsics, method="orb")
+    assert result.camera_count == 5
+    assert result.seed_pair != (0, 1)
+    assert result.point_count >= 500
+    assert result.bundle_adjustment_result is not None
+    assert result.bundle_adjustment_result.final_rmse < 0.6
+
+    est_centers = np.array(
+        [
+            -Rotation.from_rotvec(result.camera_rotations[i]).as_matrix().T
+            @ result.camera_translations[i]
+            for i in range(result.camera_count)
+        ]
+    )
+    gt_centers = np.array(
+        [-poses_gt[v][0].T @ poses_gt[v][1].reshape(3) for v in result.view_order]
+    )
+    mu_e, mu_g = est_centers.mean(axis=0), gt_centers.mean(axis=0)
+    u_mat, s_vals, vt_mat = np.linalg.svd(
+        (gt_centers - mu_g).T @ (est_centers - mu_e)
+    )
+    det_sign = np.linalg.det(u_mat @ vt_mat)
+    r_align = u_mat @ np.diag([1.0, 1.0, det_sign]) @ vt_mat
+    scale = np.sum(s_vals * np.array([1.0, 1.0, det_sign])) / np.sum(
+        (est_centers - mu_e) ** 2
+    )
+    aligned = scale * ((est_centers - mu_e) @ r_align.T) + mu_g
+    center_errors = np.linalg.norm(aligned - gt_centers, axis=1)
+    assert float(np.mean(center_errors)) < 0.02
+
+    alpha_est = estimate_alpha(result.points_3d)
+    assert alpha_est > 0
+    mesh = generate_mesh(result.points_3d, auto_alpha=True)
+    assert mesh.alpha is not None and mesh.alpha > 0
+    assert mesh.vertex_count >= 100
+    assert mesh.face_count >= 100
+    glb_path = export_glb(mesh, tmp_path / "scene.glb")
+    assert glb_path.is_file() and glb_path.stat().st_size > 0

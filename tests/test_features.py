@@ -379,3 +379,51 @@ def test_analyze_image_set_rejects_mismatched_masks():
 
     with pytest.raises(InputError, match="Mask count"):
         analyze_image_set([image.copy(), image.copy()], masks=[mask])
+
+
+def test_cross_check_enforces_one_to_one_matches():
+    kps_first = tuple(cv2.KeyPoint(float(i), 10.0, 1.0) for i in range(3))
+    kps_second = tuple(cv2.KeyPoint(float(i), 10.0, 1.0) for i in range(3))
+    desc_first = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.95, 0.05, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    desc_second = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+    first = FeatureSet("sift", kps_first, desc_first, (100, 100))
+    second = FeatureSet("sift", kps_second, desc_second, (100, 100))
+
+    one_way = match_features(first, second, ratio_threshold=0.8, cross_check=False)
+    mutual = match_features(first, second, ratio_threshold=0.8, cross_check=True)
+
+    assert len(one_way) == 3
+    assert len(mutual) == 2
+    assert {(m.queryIdx, m.trainIdx) for m in mutual} == {(0, 0), (2, 2)}
+
+
+def test_invalid_cross_check_flag():
+    empty = FeatureSet("orb", (), None, (100, 100))
+    with pytest.raises(ConfigurationError, match="cross_check"):
+        match_features(empty, empty, cross_check="yes")
+
+
+def test_sift_descriptors_are_rootsift_normalized():
+    image = make_checkerboard()
+    try:
+        result = extract_features(image, method="sift")
+    except InputError:
+        pytest.skip("SIFT unavailable in this OpenCV build.")
+
+    assert result.descriptors is not None
+    norms = np.sum(result.descriptors**2, axis=1)
+    assert np.allclose(norms, 1.0, atol=1e-4)

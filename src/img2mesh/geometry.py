@@ -334,6 +334,194 @@ class TriangulationResult:
         return len(self.points_3d)
 
 
+def _refine_two_view_points(
+    points_camera_one: np.ndarray,
+    first_pixels: np.ndarray,
+    second_pixels: np.ndarray,
+    camera_matrix: np.ndarray,
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    depth_valid: np.ndarray,
+    min_depth: float,
+    iterations: int = 4,
+) -> np.ndarray:
+    """Refine two-view DLT points by minimizing geometric reprojection error."""
+    indices = np.flatnonzero(depth_valid)
+    if len(indices) == 0:
+        return points_camera_one
+
+    refined = points_camera_one.copy()
+    pts = refined[indices]
+    u1 = first_pixels[indices]
+    u2 = second_pixels[indices]
+    fx = float(camera_matrix[0, 0])
+    fy = float(camera_matrix[1, 1])
+    cx = float(camera_matrix[0, 2])
+    cy = float(camera_matrix[1, 2])
+    t_flat = translation.reshape(1, 3)
+
+    def _eval(x_pts):
+        q1 = x_pts
+        q2 = (rotation @ x_pts.T).T + t_flat
+        z1 = q1[:, 2]
+        z2 = q2[:, 2]
+        valid = np.isfinite(q1).all(axis=1) & (z1 > min_depth) & (z2 > min_depth)
+        err = np.full(len(x_pts), np.inf, dtype=np.float64)
+        p1 = np.empty((len(x_pts), 2), dtype=np.float64)
+        p2 = np.empty((len(x_pts), 2), dtype=np.float64)
+        p1[valid, 0] = fx * q1[valid, 0] / z1[valid] + cx
+        p1[valid, 1] = fy * q1[valid, 1] / z1[valid] + cy
+        p2[valid, 0] = fx * q2[valid, 0] / z2[valid] + cx
+        p2[valid, 1] = fy * q2[valid, 1] / z2[valid] + cy
+        r1 = p1 - u1
+        r2 = p2 - u2
+        err[valid] = np.sum(r1[valid] ** 2, axis=1) + np.sum(r2[valid] ** 2, axis=1)
+        return q1, q2, r1, r2, err, valid
+
+    damping = 1e-4
+    for _ in range(iterations):
+        q1, q2, r1, r2, err, valid = _eval(pts)
+        active = np.flatnonzero(valid)
+        if len(active) == 0:
+            break
+
+        n = len(active)
+        j_all = np.zeros((n, 4, 3), dtype=np.float64)
+        z1 = q1[active, 2]
+        z2 = q2[active, 2]
+
+        j_all[:, 0, 0] = fx / z1
+        j_all[:, 0, 2] = -fx * q1[active, 0] / (z1 * z1)
+        j_all[:, 1, 1] = fy / z1
+        j_all[:, 1, 2] = -fy * q1[active, 1] / (z1 * z1)
+
+        j2_cam = np.zeros((n, 2, 3), dtype=np.float64)
+        j2_cam[:, 0, 0] = fx / z2
+        j2_cam[:, 0, 2] = -fx * q2[active, 0] / (z2 * z2)
+        j2_cam[:, 1, 1] = fy / z2
+        j2_cam[:, 1, 2] = -fy * q2[active, 1] / (z2 * z2)
+        j_all[:, 2:, :] = j2_cam @ rotation
+
+        res = np.concatenate((r1[active], r2[active]), axis=1)
+        jtj = np.einsum("nji,njk->nik", j_all, j_all)
+        jtj += damping * np.eye(3)[None, :, :]
+        jtr = np.einsum("nji,nj->ni", j_all, res)
+
+        try:
+            step = -np.linalg.solve(jtj, jtr[:, :, None])[..., 0]
+        except np.linalg.LinAlgError:
+            break
+
+        candidate = pts.copy()
+        finite_step = np.isfinite(step).all(axis=1)
+        candidate[active[finite_step]] += step[finite_step]
+        _, _, _, _, new_err, new_valid = _eval(candidate)
+        improved = new_valid & (new_err < err)
+        if not np.any(improved):
+            break
+        pts[improved] = candidate[improved]
+
+    refined[indices] = pts
+    return refined
+
+
+def triangulate_multiview_point(
+    rotations: np.ndarray,
+    translations: np.ndarray,
+    pixels: np.ndarray,
+    intrinsics: CameraIntrinsics,
+    *,
+    min_depth: float = 1e-6,
+    iterations: int = 5,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Triangulate a 3D point from M >= 2 calibrated views via DLT + Gauss-Newton."""
+    view_count = len(rotations)
+    if view_count < 2 or len(translations) != view_count or len(pixels) != view_count:
+        return None
+
+    k_mat = intrinsics.matrix
+    design = np.empty((2 * view_count, 4), dtype=np.float64)
+
+    for idx in range(view_count):
+        proj = k_mat @ np.hstack((rotations[idx], translations[idx].reshape(3, 1)))
+        row_x = pixels[idx, 0] * proj[2] - proj[0]
+        row_y = pixels[idx, 1] * proj[2] - proj[1]
+        norm_x = np.linalg.norm(row_x)
+        norm_y = np.linalg.norm(row_y)
+        design[2 * idx] = row_x / norm_x if norm_x > 1e-12 else row_x
+        design[2 * idx + 1] = row_y / norm_y if norm_y > 1e-12 else row_y
+
+    try:
+        _, _, vt = np.linalg.svd(design, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+
+    homogeneous = vt[-1]
+    if not np.isfinite(homogeneous).all() or abs(homogeneous[3]) <= 1e-12:
+        return None
+
+    point = homogeneous[:3] / homogeneous[3]
+    if not np.isfinite(point).all():
+        return None
+
+    fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy
+    t_vecs = translations.reshape(view_count, 3)
+
+    def _project_and_errors(x_pt: np.ndarray):
+        cam = np.einsum("nij,j->ni", rotations, x_pt) + t_vecs
+        z = cam[:, 2]
+        if not np.isfinite(cam).all() or np.any(z <= min_depth):
+            return None, None, None
+        pred_x = fx * (cam[:, 0] / z) + cx
+        pred_y = fy * (cam[:, 1] / z) + cy
+        res = np.column_stack((pred_x - pixels[:, 0], pred_y - pixels[:, 1]))
+        return cam, res, float(np.sum(res**2))
+
+    cam, res, total_err = _project_and_errors(point)
+    if cam is None:
+        return None
+
+    damping = 1e-4
+    for _ in range(iterations):
+        z = cam[:, 2]
+        j_mat = np.empty((2 * view_count, 3), dtype=np.float64)
+        for idx in range(view_count):
+            inv_z = 1.0 / z[idx]
+            inv_z2 = inv_z * inv_z
+            j_cam = np.array(
+                [
+                    [fx * inv_z, 0.0, -fx * cam[idx, 0] * inv_z2],
+                    [0.0, fy * inv_z, -fy * cam[idx, 1] * inv_z2],
+                ],
+                dtype=np.float64,
+            )
+            j_mat[2 * idx : 2 * idx + 2] = j_cam @ rotations[idx]
+
+        lhs = j_mat.T @ j_mat + damping * np.eye(3)
+        rhs = -(j_mat.T @ res.reshape(-1))
+        try:
+            delta = np.linalg.solve(lhs, rhs)
+        except np.linalg.LinAlgError:
+            break
+
+        if not np.isfinite(delta).all() or np.linalg.norm(delta) < 1e-10:
+            break
+
+        candidate = point + delta
+        new_cam, new_res, new_err = _project_and_errors(candidate)
+        if new_cam is not None and new_err < total_err:
+            point = candidate
+            cam = new_cam
+            res = new_res
+            total_err = new_err
+            damping = max(damping * 0.5, 1e-7)
+        else:
+            damping *= 10.0
+
+    errors = np.linalg.norm(res, axis=1)
+    return point, errors
+
+
 def triangulate_points(
     points_first: np.ndarray,
     points_second: np.ndarray,
@@ -410,6 +598,26 @@ def triangulate_points(
 
     safe_denominators = np.where(finite, denominators, 1.0)
     points_camera_one = (homogeneous[:3] / safe_denominators).T
+    points_camera_two = (rotation @ points_camera_one.T + translation).T
+
+    depth_valid = (
+        finite
+        & np.isfinite(points_camera_one).all(axis=1)
+        & np.isfinite(points_camera_two).all(axis=1)
+        & (points_camera_one[:, 2] > min_depth)
+        & (points_camera_two[:, 2] > min_depth)
+    )
+
+    points_camera_one = _refine_two_view_points(
+        points_camera_one,
+        first_inliers,
+        second_inliers,
+        camera_matrix,
+        rotation,
+        translation,
+        depth_valid,
+        min_depth,
+    )
     points_camera_two = (rotation @ points_camera_one.T + translation).T
 
     depth_valid = (
