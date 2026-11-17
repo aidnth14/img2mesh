@@ -1,0 +1,378 @@
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+from collections.abc import Sequence
+from pathlib import Path
+
+from .config import Img2MeshError, InputError, OutputError
+from .geometry import CameraIntrinsics
+from .image import PreprocessingOptions, preprocess_image
+from .io import (
+    SUPPORTED_IMAGE_EXTENSIONS,
+    export_mesh,
+    load_image,
+    validate_image_path,
+)
+from .mesh import generate_mesh
+from .pipeline import reconstruct_image_set
+
+__version__ = "0.1.0"
+
+LOGGER = logging.getLogger("img2mesh")
+
+SUPPORTED_OUTPUT_FORMATS = {
+    ".glb": "glb",
+    ".obj": "obj",
+    ".stl": "stl",
+}
+
+EXIT_SUCCESS = 0
+EXIT_ERROR = 1
+EXIT_INSUFFICIENT_VIEWS = 3
+EXIT_RECONSTRUCTION_NOT_IMPLEMENTED = EXIT_INSUFFICIENT_VIEWS
+
+
+def validate_input_image(path: str | Path) -> Path:
+    return validate_image_path(path)
+
+
+def discover_input_images(
+    path: str | Path,
+    *,
+    recursive: bool = False,
+) -> tuple[Path, ...]:
+    source = Path(path).expanduser()
+
+    if source.is_file():
+        return (validate_input_image(source),)
+
+    if not source.is_dir():
+        raise InputError(f"Input image file or directory does not exist: {source}")
+
+    try:
+        candidates = source.rglob("*") if recursive else source.iterdir()
+        image_paths = sorted(
+            (
+                item
+                for item in candidates
+                if item.is_file()
+                and not item.name.startswith(".")
+                and item.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS
+            ),
+            key=lambda item: str(item).casefold(),
+        )
+    except OSError as exc:
+        raise InputError(f"Could not read input directory '{source}': {exc}") from exc
+
+    if not image_paths:
+        raise InputError(
+            f"No supported images found in '{source}'. "
+            "Supported formats: PNG, JPEG, BMP, TIFF, and WEBP."
+        )
+
+    return tuple(validate_input_image(item) for item in image_paths)
+
+
+def detect_output_format(path: str | Path) -> str:
+    extension = Path(path).expanduser().suffix.lower()
+
+    if extension not in SUPPORTED_OUTPUT_FORMATS:
+        supported = ", ".join(SUPPORTED_OUTPUT_FORMATS.values())
+        raise OutputError(
+            f"Unsupported output format '{extension}'. Supported formats: {supported}."
+        )
+
+    return SUPPORTED_OUTPUT_FORMATS[extension]
+
+
+def validate_output_path(
+    path: str | Path,
+    overwrite: bool = False,
+) -> Path:
+    output_path = Path(path).expanduser()
+
+    if output_path.exists() and output_path.is_dir():
+        raise OutputError(f"Output destination is a directory: {output_path}")
+
+    detect_output_format(output_path)
+
+    output_directory = output_path.parent
+    if not output_directory.exists():
+        raise OutputError(f"Output directory does not exist: {output_directory}")
+
+    if not output_directory.is_dir():
+        raise OutputError(f"Output parent is not a directory: {output_directory}")
+
+    if output_path.exists() and not overwrite:
+        raise OutputError(
+            f"Output file already exists: {output_path}. Use --overwrite to replace it."
+        )
+
+    return output_path
+
+
+def _positive_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Must be a positive integer.") from exc
+
+    if result <= 0:
+        raise argparse.ArgumentTypeError("Must be a positive integer.")
+
+    return result
+
+
+def _positive_float(value: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Must be a positive number.") from exc
+
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("Must be a positive finite number.")
+
+    return result
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="img2mesh",
+        description="Reconstruct a sparse 3D mesh from overlapping photographs.",
+        epilog="Example: img2mesh ./photos ./model.glb",
+    )
+
+    parser.add_argument(
+        "input_image",
+        type=Path,
+        help="Input image file or directory of overlapping photographs.",
+    )
+    parser.add_argument(
+        "output_model",
+        type=Path,
+        help="Output mesh path (.glb, .obj, or .stl).",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable debug logging.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing output file.",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="Decode and validate inputs without running reconstruction.",
+    )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Search input directories recursively.",
+    )
+    parser.add_argument(
+        "--method",
+        choices=("orb", "sift"),
+        default="orb",
+        help="Feature detector (default: orb).",
+    )
+    parser.add_argument(
+        "--max-features",
+        type=_positive_int,
+        default=2000,
+        help="Maximum features detected per image (default: 2000).",
+    )
+    parser.add_argument(
+        "--pairing-strategy",
+        choices=("all", "sequential"),
+        default="all",
+        help="Image pairing strategy (default: all).",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=_positive_float,
+        default=None,
+        help="Alpha-shape radius (omit for convex hull).",
+    )
+    parser.add_argument(
+        "--no-bundle-adjustment",
+        action="store_true",
+        help="Skip bundle adjustment refinement.",
+    )
+    parser.add_argument(
+        "--focal-length",
+        type=_positive_float,
+        default=None,
+        help="Camera focal length in pixels.",
+    )
+    parser.add_argument(
+        "--max-dimension",
+        type=_positive_int,
+        default=None,
+        help="Maximum image width or height in pixels.",
+    )
+    parser.add_argument(
+        "--normalize-contrast",
+        action="store_true",
+        help="Stretch image contrast before feature detection.",
+    )
+    parser.add_argument(
+        "--denoise",
+        choices=("none", "median", "gaussian"),
+        default="none",
+        help="Denoising filter (default: none).",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+
+    return parser
+
+
+def _close_images(images) -> None:
+    for image in images:
+        try:
+            image.close()
+        except Exception:
+            LOGGER.warning("Could not close an input image cleanly.")
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format="%(levelname)s: %(message)s",
+    )
+    LOGGER.setLevel(log_level)
+
+    images = []
+
+    try:
+        image_paths = discover_input_images(
+            args.input_image,
+            recursive=args.recursive,
+        )
+        output_path = validate_output_path(
+            args.output_model,
+            overwrite=args.overwrite,
+        )
+        output_format = detect_output_format(output_path)
+
+        preprocessing_options = None
+        if (
+            args.max_dimension is not None
+            or args.normalize_contrast
+            or args.denoise != "none"
+        ):
+            preprocessing_options = PreprocessingOptions(
+                max_dimension=args.max_dimension,
+                normalize_contrast=args.normalize_contrast,
+                denoise=args.denoise,
+            )
+
+        LOGGER.info("Found %d input image(s).", len(image_paths))
+        LOGGER.info("Output destination: %s", output_path)
+        LOGGER.info("Output format: %s", output_format)
+
+        for image_path in image_paths:
+            image = load_image(image_path)
+            if preprocessing_options is not None:
+                try:
+                    preprocessed = preprocess_image(image, preprocessing_options)
+                finally:
+                    image.close()
+                image = preprocessed
+            images.append(image)
+            LOGGER.debug(
+                "Loaded %s: %d x %d pixels",
+                image_path,
+                image.width,
+                image.height,
+            )
+
+        if args.validate_only:
+            LOGGER.info(
+                "Validation successful: %d image(s) decoded. No model was generated.",
+                len(images),
+            )
+            return EXIT_SUCCESS
+
+        if len(images) < 2:
+            LOGGER.error(
+                "Multi-view reconstruction requires at least two overlapping "
+                "photographs. Provide a directory containing two or more images."
+            )
+            return EXIT_INSUFFICIENT_VIEWS
+
+        LOGGER.info("Starting feature extraction and camera reconstruction.")
+
+        reconstruction_kwargs = {
+            "method": args.method,
+            "max_features": args.max_features,
+            "pairing_strategy": args.pairing_strategy,
+            "run_bundle_adjustment": not args.no_bundle_adjustment,
+        }
+        if args.focal_length is not None:
+            reconstruction_kwargs["intrinsics"] = CameraIntrinsics.from_focal_length(
+                images[0].width,
+                images[0].height,
+                args.focal_length,
+            )
+
+        reconstruction = reconstruct_image_set(
+            images,
+            **reconstruction_kwargs,
+        )
+
+        LOGGER.info(
+            "Reconstruction completed: %d cameras and %d sparse 3D points.",
+            reconstruction.camera_count,
+            reconstruction.point_count,
+        )
+
+        LOGGER.info("Generating triangle mesh.")
+
+        mesh = generate_mesh(
+            reconstruction.points_3d,
+            alpha=args.alpha,
+        )
+
+        LOGGER.info(
+            "Mesh generated: %d vertices and %d faces.",
+            mesh.vertex_count,
+            mesh.face_count,
+        )
+
+        export_mesh(
+            mesh,
+            output_path,
+            overwrite=args.overwrite,
+        )
+
+        LOGGER.info("Model successfully exported to %s", output_path)
+        return EXIT_SUCCESS
+
+    except Img2MeshError as exc:
+        LOGGER.error("%s", exc)
+        return EXIT_ERROR
+
+    except (OSError, ValueError, RuntimeError) as exc:
+        LOGGER.error("Processing failed: %s", exc)
+        return EXIT_ERROR
+
+    finally:
+        _close_images(images)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
