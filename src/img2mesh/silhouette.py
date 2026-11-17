@@ -339,76 +339,77 @@ def marching_tetrahedra(
     c_off = t_cells[:, None, :] + _MT_CORNERS[t_corners]
     flat_c = c_off[..., 0] * stride_x + c_off[..., 1] * stride_y + c_off[..., 2]
 
-    verts_dict: dict[tuple[int, int], int] = {}
-    verts_list: list[np.ndarray] = []
-    faces_list: list[list[int]] = []
+    # Corner order per tet: inside corners first, then outside, each ascending
+    # (a stable sort), so position 0 is the first inside corner and position
+    # ``n_in`` the first outside corner.
+    perm = np.argsort(~t_in, axis=1, kind="stable")
+    n_in = t_in.sum(axis=1)
+    rows = np.arange(len(perm))[:, None]
+    pf = flat_c[rows, perm]
+    pv = t_vals[rows, perm]
 
-    def get_vertex(f0: int, f1: int, v0: float, v1: float) -> int:
-        key = (f0, f1) if f0 < f1 else (f1, f0)
-        existing = verts_dict.get(key)
-        if existing is not None:
-            return existing
-        denom = v1 - v0
-        alpha = float((level - v0) / denom) if abs(denom) > 1e-12 else 0.5
-        alpha = min(max(alpha, 0.0), 1.0)
-        x0, rem0 = divmod(f0, stride_x)
-        y0, z0 = divmod(rem0, stride_y)
-        x1, rem1 = divmod(f1, stride_x)
-        y1, z1 = divmod(rem1, stride_y)
-        p0 = origin_arr + voxel_size * np.array([x0, y0, z0], dtype=np.float64)
-        p1 = origin_arr + voxel_size * np.array([x1, y1, z1], dtype=np.float64)
-        idx = len(verts_list)
-        verts_list.append(p0 + alpha * (p1 - p0))
-        verts_dict[key] = idx
-        return idx
+    def corner_xyz(flat_ids: np.ndarray) -> np.ndarray:
+        x, rem = np.divmod(flat_ids, stride_x)
+        y, z = np.divmod(rem, stride_y)
+        return origin_arr + voxel_size * np.stack((x, y, z), axis=-1)
 
-    def corner_pos(flat_id: int) -> np.ndarray:
-        x, rem = divmod(flat_id, stride_x)
-        y, z = divmod(rem, stride_y)
-        return origin_arr + voxel_size * np.array([x, y, z], dtype=np.float64)
+    single = (n_in == 1) | (n_in == 3)
+    double = n_in == 2
+    s_rows = np.flatnonzero(single)
+    d_rows = np.flatnonzero(double)
 
-    for k in range(len(t_cells)):
-        fc = flat_c[k]
-        fv = t_vals[k]
-        fi = t_in[k]
-        in_idx = [i for i in range(4) if fi[i]]
-        out_idx = [i for i in range(4) if not fi[i]]
-        p_in = corner_pos(int(fc[in_idx[0]]))
-        p_out = corner_pos(int(fc[out_idx[0]]))
+    # One triangle: apex a is the lone in (or out) corner; b, c, d the others.
+    s_one_in = n_in[s_rows] == 1
+    s_apex = np.where(s_one_in, 0, 3)
+    s_others = np.where(s_one_in[:, None], [1, 2, 3], [0, 1, 2])
+    s_a = np.repeat(s_apex[:, None], 3, axis=1)
+    # Two triangles: in corners (0, 1) to out corners (2, 3).
+    d_a = np.array([[0, 0, 1, 1]])
+    d_b = np.array([[2, 3, 2, 3]])
 
-        if len(in_idx) in (1, 3):
-            a = in_idx[0] if len(in_idx) == 1 else out_idx[0]
-            b, c, d = out_idx if len(in_idx) == 1 else in_idx
-            va = get_vertex(int(fc[a]), int(fc[b]), float(fv[a]), float(fv[b]))
-            vb = get_vertex(int(fc[a]), int(fc[c]), float(fv[a]), float(fv[c]))
-            vc = get_vertex(int(fc[a]), int(fc[d]), float(fv[a]), float(fv[d]))
-            normal = np.cross(
-                verts_list[vb] - verts_list[va],
-                verts_list[vc] - verts_list[va],
-            )
-            if np.dot(normal, p_out - p_in) < 0:
-                faces_list.append([va, vc, vb])
-            else:
-                faces_list.append([va, vb, vc])
-        else:
-            a0, a1 = in_idx
-            b0, b1 = out_idx
-            v00 = get_vertex(int(fc[a0]), int(fc[b0]), float(fv[a0]), float(fv[b0]))
-            v01 = get_vertex(int(fc[a0]), int(fc[b1]), float(fv[a0]), float(fv[b1]))
-            v10 = get_vertex(int(fc[a1]), int(fc[b0]), float(fv[a1]), float(fv[b0]))
-            v11 = get_vertex(int(fc[a1]), int(fc[b1]), float(fv[a1]), float(fv[b1]))
-            for tri in ([v00, v01, v11], [v00, v11, v10]):
-                normal = np.cross(
-                    verts_list[tri[1]] - verts_list[tri[0]],
-                    verts_list[tri[2]] - verts_list[tri[0]],
-                )
-                if np.dot(normal, p_out - p_in) < 0:
-                    faces_list.append([tri[0], tri[2], tri[1]])
-                else:
-                    faces_list.append(tri)
+    edge_rows = np.concatenate(
+        (np.repeat(s_rows, 3), np.repeat(d_rows, 4))
+    )
+    edge_a = np.concatenate(
+        (s_a.ravel(), np.broadcast_to(d_a, (len(d_rows), 4)).ravel())
+    )
+    edge_b = np.concatenate(
+        (s_others.ravel(), np.broadcast_to(d_b, (len(d_rows), 4)).ravel())
+    )
+    f0 = pf[edge_rows, edge_a]
+    f1 = pf[edge_rows, edge_b]
+    v0 = pv[edge_rows, edge_a]
+    v1 = pv[edge_rows, edge_b]
 
-    vertices = np.asarray(verts_list, dtype=np.float64)
-    faces = np.asarray(faces_list, dtype=np.int64)
+    total = int(px) * int(py) * int(pz)
+    keys = np.minimum(f0, f1) * total + np.maximum(f0, f1)
+    unique_keys, first, edge_vertex = np.unique(
+        keys, return_index=True, return_inverse=True
+    )
+    denom = v1[first] - v0[first]
+    safe = np.abs(denom) > 1e-12
+    alpha = np.full(len(unique_keys), 0.5)
+    alpha[safe] = (level - v0[first][safe]) / denom[safe]
+    alpha = np.clip(alpha, 0.0, 1.0)
+    p0 = corner_xyz(f0[first])
+    p1 = corner_xyz(f1[first])
+    vertices = p0 + alpha[:, None] * (p1 - p0)
+
+    n_single = 3 * len(s_rows)
+    s_tris = edge_vertex[:n_single].reshape(-1, 3)
+    d_quads = edge_vertex[n_single:].reshape(-1, 4)  # v00, v01, v10, v11
+    d_tris = np.concatenate(
+        (d_quads[:, [0, 1, 3]], d_quads[:, [0, 3, 2]]), axis=0
+    )
+    faces = np.concatenate((s_tris, d_tris), axis=0)
+    tri_rows = np.concatenate((s_rows, d_rows, d_rows))
+
+    p_in = corner_xyz(pf[tri_rows, 0])
+    p_out = corner_xyz(pf[tri_rows, n_in[tri_rows]])
+    tri = vertices[faces]
+    normal = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+    flip = np.einsum("ij,ij->i", normal, p_out - p_in) < 0
+    faces[flip] = faces[flip][:, [0, 2, 1]]
     if len(faces) == 0:
         raise ReconstructionError("Marching tetrahedra produced no faces.")
 
@@ -725,7 +726,7 @@ def reconstruct_visual_hull(
             view_images,
             bool_masks,
             intrinsics,
-            resolution=max(resolution + resolution // 2, 96),
+            resolution=max(resolution + resolution // 2, 64),
             hollow=None if carve_concavity else False,
             required=shape_prior == "revolution",
         )

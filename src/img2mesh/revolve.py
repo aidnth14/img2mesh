@@ -532,14 +532,21 @@ def _fit_pose(
     bw, bh = float(x1 - x0 + 1), float(y1 - y0 + 1)
     bcx, bcy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
 
-    def ortho_fit(rot: np.ndarray):
-        p = points @ rot.T
+    # The exhaustive orientation search only needs a coarse silhouette: use a
+    # smaller grid and a matching subsample of points (same splat density).
+    coarse = max(32, grid * 5 // 8)
+    cscale = coarse / float(size)
+    coarse_target = cv2.resize(crop, (coarse, coarse), interpolation=cv2.INTER_AREA) > 0
+    coarse_pts = points[:: max(1, round((grid / coarse) ** 2))]
+
+    def ortho_fit(rot: np.ndarray, pts: np.ndarray = coarse_pts):
+        p = pts @ rot.T
         px, py = p[:, 0], p[:, 1]
         s = 0.5 * (bw / max(np.ptp(px), 1e-9) + bh / max(np.ptp(py), 1e-9))
         a = bcx - s * 0.5 * (px.max() + px.min())
         b = bcy - s * 0.5 * (py.max() + py.min())
-        uv = np.column_stack(((s * px + a - sx0) * gscale, (s * py + b - sy0) * gscale))
-        return _iou(_splat(uv, (grid, grid)), target), s, a, b
+        uv = np.column_stack(((s * px + a - sx0) * cscale, (s * py + b - sy0) * cscale))
+        return _iou(_splat(uv, (coarse, coarse)), coarse_target), s, a, b
 
     el_guess = view.elevation_deg
     els = sorted(
@@ -576,7 +583,7 @@ def _fit_pose(
                     best_score, best_params = score, (float(az), el_c, roll)
 
     rot0 = _base_rotation(*best_params)
-    _, s, a, b = ortho_fit(rot0)
+    _, s, a, b = ortho_fit(rot0, points)
     fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy
     tz = fx / s
     t0 = np.array([(a - cx) / s, (b - cy) / s, tz])
@@ -650,35 +657,25 @@ def _depth_buffer(
     faces: np.ndarray,
     intrinsics: CameraIntrinsics,
 ) -> np.ndarray:
-    """Per-pixel nearest depth from dense barycentric samples of every face."""
+    """Per-pixel nearest depth from every vertex plus every face centroid.
+
+    Marching-tetrahedra faces project to about a pixel, so vertices and
+    centroids cover the surface; a 3x3 min filter closes remaining gaps.
+    """
     width, height = intrinsics.image_width, intrinsics.image_height
-    bary = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, 0.0, 1.0],
-            [1 / 3, 1 / 3, 1 / 3],
-            [2 / 3, 1 / 6, 1 / 6],
-            [1 / 6, 2 / 3, 1 / 6],
-            [1 / 6, 1 / 6, 2 / 3],
-            [0.5, 0.5, 0.0],
-            [0.0, 0.5, 0.5],
-            [0.5, 0.0, 0.5],
-        ]
-    )
-    pts = np.einsum("sk,fkd->fsd", bary, cam[faces]).reshape(-1, 3)
+    pts = np.concatenate((cam, cam[faces].mean(axis=1)), axis=0)
     z = pts[:, 2]
     front = z > 1e-6
     u = np.round(intrinsics.fx * pts[front, 0] / z[front] + intrinsics.cx)
     v = np.round(intrinsics.fy * pts[front, 1] / z[front] + intrinsics.cy)
     ok = (u >= 0) & (u < width) & (v >= 0) & (v < height)
-    zbuf = np.full((height, width), 1e9, dtype=np.float32)
+    zbuf = np.full(height * width, 1e9, dtype=np.float32)
     np.minimum.at(
         zbuf,
-        (v[ok].astype(np.int64), u[ok].astype(np.int64)),
+        v[ok].astype(np.int64) * width + u[ok].astype(np.int64),
         z[front][ok].astype(np.float32),
     )
-    return cv2.erode(zbuf, np.ones((3, 3), np.uint8))
+    return cv2.erode(zbuf.reshape(height, width), np.ones((3, 3), np.uint8))
 
 
 def _axisymmetric_prior(
