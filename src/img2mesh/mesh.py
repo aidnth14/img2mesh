@@ -15,6 +15,7 @@ class MeshResult:
     alpha: float | None
     input_point_count: int
     retained_point_count: int
+    vertex_colors: np.ndarray | None = None
 
     @property
     def vertex_count(self) -> int:

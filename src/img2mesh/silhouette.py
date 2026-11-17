@@ -51,6 +51,7 @@ class VisualHullResult:
     masks: tuple[np.ndarray, ...]
     per_view_iou: tuple[float, ...]
     per_view_dice: tuple[float, ...]
+    method: str = "visual_hull"
 
     @property
     def mean_iou(self) -> float:
@@ -565,6 +566,88 @@ def _carve_top_cavity(
     return updated
 
 
+SHAPE_PRIORS = ("auto", "revolution", "none")
+_AUTO_REVOLUTION_MIN_IOU = 0.75
+
+
+def _silhouette_scores(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    poses: Sequence[tuple[np.ndarray, np.ndarray]],
+    masks: Sequence[np.ndarray],
+    intrinsics: CameraIntrinsics,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    ious = []
+    dices = []
+    for (rotation, translation), mask in zip(poses, masks, strict=True):
+        proj = rasterize_mesh_silhouette(
+            vertices, faces, rotation, translation, intrinsics
+        )
+        inter = np.count_nonzero(proj & mask)
+        union = np.count_nonzero(proj | mask)
+        denom = np.count_nonzero(proj) + np.count_nonzero(mask)
+        ious.append(float(inter / max(union, 1)))
+        dices.append(float((2.0 * inter) / max(denom, 1)))
+    return tuple(ious), tuple(dices)
+
+
+def _try_revolution(
+    images: Sequence[Image.Image],
+    masks: Sequence[np.ndarray],
+    intrinsics: CameraIntrinsics,
+    *,
+    resolution: int,
+    hollow: bool | None,
+    required: bool,
+) -> VisualHullResult | None:
+    from .revolve import analyze_view, is_surface_of_revolution, reconstruct_revolution
+
+    try:
+        analyses = [analyze_view(m) for m in masks]
+        if not required and not is_surface_of_revolution(analyses):
+            return None
+        model = reconstruct_revolution(
+            images,
+            masks,
+            intrinsics,
+            analyses=analyses,
+            resolution=resolution,
+            hollow=hollow,
+        )
+    except ReconstructionError:
+        if required:
+            raise
+        return None
+
+    poses = list(zip(model.rotations, model.translations, strict=True))
+    ious, dices = _silhouette_scores(
+        model.vertices, model.faces, poses, masks, intrinsics
+    )
+    if not required and float(np.mean(ious)) < _AUTO_REVOLUTION_MIN_IOU:
+        return None
+
+    mesh = MeshResult(
+        vertices=model.vertices,
+        faces=model.faces,
+        alpha=None,
+        input_point_count=len(model.vertices),
+        retained_point_count=len(model.vertices),
+        vertex_colors=model.vertex_colors,
+    )
+    return VisualHullResult(
+        mesh=mesh,
+        camera_rotations=np.vstack(
+            [Rotation.from_matrix(r).as_rotvec() for r in model.rotations]
+        ),
+        camera_translations=np.vstack([t.reshape(3) for t in model.translations]),
+        intrinsics=intrinsics,
+        masks=tuple(np.asarray(m, dtype=np.uint8) * 255 for m in masks),
+        per_view_iou=ious,
+        per_view_dice=dices,
+        method="revolution",
+    )
+
+
 def reconstruct_visual_hull(
     images: Sequence[Image.Image],
     *,
@@ -572,8 +655,18 @@ def reconstruct_visual_hull(
     masks: Sequence[np.ndarray] | None = None,
     resolution: int = 88,
     carve_concavity: bool = True,
+    shape_prior: str = "auto",
 ) -> VisualHullResult:
-    """Reconstruct a watertight 3D mesh from multi-view silhouettes."""
+    """Reconstruct a watertight 3D mesh from multi-view silhouettes.
+
+    ``shape_prior`` selects the model:
+
+    - ``"auto"`` (default): use the surface-of-revolution model when the
+      silhouettes look rotationally symmetric (cups, bowls, vases, bottles),
+      otherwise fall back to visual-hull carving.
+    - ``"revolution"``: always use the surface-of-revolution model.
+    - ``"none"``: always use visual-hull carving.
+    """
     if isinstance(images, (str, bytes)):
         raise InputError("Expected a sequence of decoded PIL images.")
 
@@ -600,6 +693,11 @@ def reconstruct_visual_hull(
     if not isinstance(carve_concavity, bool):
         raise ConfigurationError("carve_concavity must be True or False.")
 
+    if shape_prior not in SHAPE_PRIORS:
+        raise ConfigurationError(
+            f"shape_prior must be one of: {', '.join(SHAPE_PRIORS)}."
+        )
+
     if intrinsics is None:
         focal = float(max(width, height)) * 1.4
         intrinsics = CameraIntrinsics.from_focal_length(width, height, focal)
@@ -621,6 +719,18 @@ def reconstruct_visual_hull(
         raise ReconstructionError(
             "Foreground segmentation produced an empty mask for one or more views."
         )
+
+    if shape_prior != "none":
+        revolved = _try_revolution(
+            view_images,
+            bool_masks,
+            intrinsics,
+            resolution=max(resolution + resolution // 2, 96),
+            hollow=None if carve_concavity else False,
+            required=shape_prior == "revolution",
+        )
+        if revolved is not None:
+            return revolved
 
     dist_outside = [distance_transform_edt(~m) for m in bool_masks]
     mask_info = []
@@ -791,17 +901,9 @@ def reconstruct_visual_hull(
         level=0.45,
     )
 
-    per_view_iou = []
-    per_view_dice = []
-    for (rotation, translation), mask in zip(resolved_poses, bool_masks, strict=True):
-        proj = rasterize_mesh_silhouette(
-            vertices, faces, rotation, translation, intrinsics
-        )
-        inter = np.count_nonzero(proj & mask)
-        union = np.count_nonzero(proj | mask)
-        denom = np.count_nonzero(proj) + np.count_nonzero(mask)
-        per_view_iou.append(float(inter / max(union, 1)))
-        per_view_dice.append(float((2.0 * inter) / max(denom, 1)))
+    per_view_iou, per_view_dice = _silhouette_scores(
+        vertices, faces, resolved_poses, bool_masks, intrinsics
+    )
 
     rot_vecs = np.vstack(
         [
@@ -824,6 +926,6 @@ def reconstruct_visual_hull(
         camera_translations=trans_vecs,
         intrinsics=intrinsics,
         masks=tuple(m.astype(np.uint8) * 255 for m in bool_masks),
-        per_view_iou=tuple(per_view_iou),
-        per_view_dice=tuple(per_view_dice),
+        per_view_iou=per_view_iou,
+        per_view_dice=per_view_dice,
     )

@@ -322,3 +322,71 @@ def test_extract_exif_focal_length_and_scaling(tmp_path):
 
     scaled = extract_exif_focal_length(path, target_size=(200, 150))
     assert scaled == pytest.approx((28.0 / 36.0) * 200.0)
+
+
+def _colored_tetrahedron():
+    base = tetrahedron()
+    colors = np.array(
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [0.5, 0.25, 0.125]]
+    )
+    return MeshResult(
+        vertices=base.vertices,
+        faces=base.faces,
+        alpha=None,
+        input_point_count=4,
+        retained_point_count=4,
+        vertex_colors=colors,
+    )
+
+
+def test_export_obj_writes_vertex_colors(tmp_path):
+    path = export_obj(_colored_tetrahedron(), tmp_path / "model.obj")
+    vertex_lines = [
+        line for line in path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("v ")
+    ]
+    assert len(vertex_lines) == 4
+    assert all(len(line.split()) == 7 for line in vertex_lines)
+    assert vertex_lines[3].split()[4:] == ["0.5000", "0.2500", "0.1250"]
+
+
+def test_export_glb_writes_color_attribute_and_material(tmp_path):
+    path = export_glb(_colored_tetrahedron(), tmp_path / "model.glb")
+    data = path.read_bytes()
+    json_length, _ = struct.unpack_from("<I4s", data, 12)
+    document = json.loads(data[20 : 20 + json_length].decode("utf-8"))
+
+    primitive = document["meshes"][0]["primitives"][0]
+    color_accessor = document["accessors"][primitive["attributes"]["COLOR_0"]]
+    assert color_accessor["count"] == 4
+    assert color_accessor["type"] == "VEC3"
+    assert color_accessor["componentType"] == 5126
+    assert document["materials"][primitive["material"]]["pbrMetallicRoughness"]
+
+    view = document["bufferViews"][color_accessor["bufferView"]]
+    binary_start = 20 + json_length + 8
+    raw = data[binary_start + view["byteOffset"] :][: view["byteLength"]]
+    colors = np.frombuffer(raw, dtype="<f4").reshape(4, 3)
+    assert colors[3] == pytest.approx([0.5, 0.25, 0.125])
+
+
+def test_export_rejects_mismatched_vertex_colors(tmp_path):
+    base = tetrahedron()
+    invalid = MeshResult(
+        vertices=base.vertices,
+        faces=base.faces,
+        alpha=None,
+        input_point_count=4,
+        retained_point_count=4,
+        vertex_colors=np.zeros((3, 3)),
+    )
+    with pytest.raises(ExportError, match="colours"):
+        export_obj(invalid, tmp_path / "bad.obj")
+    with pytest.raises(ExportError, match="colours"):
+        export_glb(invalid, tmp_path / "bad.glb")
+
+
+def test_export_stl_ignores_vertex_colors(tmp_path):
+    plain = export_stl(tetrahedron(), tmp_path / "plain.stl").read_bytes()
+    colored = export_stl(_colored_tetrahedron(), tmp_path / "color.stl").read_bytes()
+    assert plain == colored

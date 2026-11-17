@@ -12,6 +12,7 @@ Sparse multi-view 3D reconstruction and surface meshing from overlapping photogr
 - Five-point essential matrix estimation, cheirality pose recovery, Sampson epipolar filtering, two-view triangulation, and EPnP + Levenberg-Marquardt camera registration (`img2mesh.geometry`)
 - Incremental multi-view reconstruction with sparse Jacobian bundle adjustment (`img2mesh.pipeline`)
 - MAD outlier filtering and Delaunay alpha-shape / convex-hull meshing (`img2mesh.mesh`)
+- Silhouette reconstruction (`img2mesh.silhouette`): visual-hull carving, or a surface-of-revolution shape prior (`img2mesh.revolve`) that rebuilds cups, bowls, vases and bottles as a smooth, hollow, watertight body with a swept handle, fits a camera pose per view, and projects vertex colours from the photos
 - Wavefront OBJ, binary STL, and glTF 2.0 binary (`.glb`) export (`img2mesh.io`)
 
 ## Installation
@@ -46,6 +47,20 @@ img2mesh ./photos ./model.obj
 img2mesh ./photos ./model.stl
 ```
 
+Silhouette reconstruction suits product shots on a plain background, where
+feature matching finds too little texture for structure-from-motion:
+
+```bash
+img2mesh ./photos ./model.glb --mode silhouette                       # auto shape prior
+img2mesh ./photos ./model.glb --mode silhouette --shape-prior revolution
+img2mesh ./photos ./model.glb --mode silhouette --shape-prior none     # plain visual hull
+```
+
+The revolution prior needs at least one near side-on view (elevation below
+about 25°). A top-down view, when present, sets the handle's out-of-plane
+thickness. The prior assumes the photos look at the object from the side or
+from above. GLB and OBJ exports carry per-vertex colour (STL has none).
+
 ### CLI Options
 
 ```text
@@ -61,6 +76,10 @@ Options:
   --pairing-strategy {all,sequential}
                             Image pairing strategy (default: all)
   --alpha FLOAT             Alpha-shape radius (omit for convex hull)
+  --mode {sfm,silhouette,auto}
+                            Reconstruction mode (default: sfm)
+  --shape-prior {auto,revolution,none}
+                            Silhouette shape model (default: auto)
   --no-bundle-adjustment    Skip bundle adjustment refinement
   --focal-length FLOAT      Camera focal length in pixels
   --max-dimension INT       Resize images so max(width, height) <= INT
@@ -83,6 +102,8 @@ src/img2mesh/
   io.py         Image loading and OBJ / STL / GLB exporters
   mesh.py       Point-cloud filtering and alpha-shape meshing
   pipeline.py   Bundle adjustment and incremental SfM pipeline
+  revolve.py    Surface-of-revolution shape prior, pose fitting, vertex colours
+  silhouette.py Foreground masks, visual hull, marching tetrahedra
 tests/
   test_cli.py
   test_features.py
@@ -90,6 +111,8 @@ tests/
   test_image.py
   test_io.py
   test_pipeline.py
+  test_revolve.py
+  test_silhouette.py
 ```
 
 ## Testing & Linting

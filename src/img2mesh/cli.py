@@ -226,6 +226,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reconstruction mode (default: sfm).",
     )
     parser.add_argument(
+        "--shape-prior",
+        choices=("auto", "revolution", "none"),
+        default="auto",
+        help=(
+            "Silhouette shape model: 'revolution' rebuilds rotationally "
+            "symmetric objects (cups, bowls, vases) as a smooth hollow body "
+            "plus handle; 'none' uses plain visual-hull carving; 'auto' picks "
+            "revolution when the views look symmetric (default: auto)."
+        ),
+    )
+    parser.add_argument(
         "--no-bundle-adjustment",
         action="store_true",
         help="Skip bundle adjustment refinement.",
@@ -268,6 +279,24 @@ def _close_images(images) -> None:
             image.close()
         except Exception:
             LOGGER.warning("Could not close an input image cleanly.")
+
+
+def _run_silhouette(images, reconstruction_kwargs, shape_prior: str):
+    vh_kwargs = {"shape_prior": shape_prior}
+    if "intrinsics" in reconstruction_kwargs:
+        vh_kwargs["intrinsics"] = reconstruction_kwargs["intrinsics"]
+    if "masks" in reconstruction_kwargs:
+        vh_kwargs["masks"] = reconstruction_kwargs["masks"]
+    vh_result = reconstruct_visual_hull(images, **vh_kwargs)
+    LOGGER.info(
+        "Silhouette reconstruction (%s) completed: mean IoU=%.2f%%, "
+        "min IoU=%.2f%%, mean Dice=%.2f%%.",
+        vh_result.method,
+        vh_result.mean_iou * 100.0,
+        vh_result.min_iou * 100.0,
+        vh_result.mean_dice * 100.0,
+    )
+    return vh_result.mesh
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -381,20 +410,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reconstruction_kwargs["masks"] = masks
 
         if args.mode == "silhouette":
-            vh_kwargs = {}
-            if "intrinsics" in reconstruction_kwargs:
-                vh_kwargs["intrinsics"] = reconstruction_kwargs["intrinsics"]
-            if "masks" in reconstruction_kwargs:
-                vh_kwargs["masks"] = reconstruction_kwargs["masks"]
-            vh_result = reconstruct_visual_hull(images, **vh_kwargs)
-            mesh = vh_result.mesh
-            LOGGER.info(
-                "Silhouette reconstruction completed: mean IoU=%.2f%%, "
-                "min IoU=%.2f%%, mean Dice=%.2f%%.",
-                vh_result.mean_iou * 100.0,
-                vh_result.min_iou * 100.0,
-                vh_result.mean_dice * 100.0,
-            )
+            mesh = _run_silhouette(images, reconstruction_kwargs, args.shape_prior)
         else:
             reconstruction = None
             sfm_error = None
@@ -420,19 +436,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "Falling back to silhouette visual-hull reconstruction%s.",
                     f" ({sfm_error})" if sfm_error else "",
                 )
-                vh_kwargs = {}
-                if "intrinsics" in reconstruction_kwargs:
-                    vh_kwargs["intrinsics"] = reconstruction_kwargs["intrinsics"]
-                if "masks" in reconstruction_kwargs:
-                    vh_kwargs["masks"] = reconstruction_kwargs["masks"]
-                vh_result = reconstruct_visual_hull(images, **vh_kwargs)
-                mesh = vh_result.mesh
-                LOGGER.info(
-                    "Silhouette reconstruction completed: mean IoU=%.2f%%, "
-                    "min IoU=%.2f%%, mean Dice=%.2f%%.",
-                    vh_result.mean_iou * 100.0,
-                    vh_result.min_iou * 100.0,
-                    vh_result.mean_dice * 100.0,
+                mesh = _run_silhouette(
+                    images, reconstruction_kwargs, args.shape_prior
                 )
             else:
                 LOGGER.info(

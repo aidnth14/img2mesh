@@ -236,6 +236,25 @@ def _prepare_mesh(mesh: MeshResult):
     return vertices, faces
 
 
+def _prepare_colors(mesh: MeshResult, vertex_count: int):
+    colors = getattr(mesh, "vertex_colors", None)
+    if colors is None:
+        return None
+
+    try:
+        colors = np.asarray(colors, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ExportError("Vertex colours must be numeric.") from exc
+
+    if colors.shape != (vertex_count, 3):
+        raise ExportError("Vertex colours must have shape (N, 3) matching vertices.")
+
+    if not np.isfinite(colors).all():
+        raise ExportError("Vertex colours must be finite.")
+
+    return np.clip(colors, 0.0, 1.0)
+
+
 def _float32_vertices(vertices):
     with np.errstate(over="ignore", invalid="ignore"):
         converted = np.asarray(vertices, dtype="<f4")
@@ -298,6 +317,7 @@ def _atomic_write(path, data: bytes, overwrite: bool) -> Path:
 
 def export_obj(mesh: MeshResult, output_path, *, overwrite=False) -> Path:
     vertices, faces = _prepare_mesh(mesh)
+    colors = _prepare_colors(mesh, len(vertices))
 
     lines = [
         "# Img2Mesh OBJ export",
@@ -305,8 +325,12 @@ def export_obj(mesh: MeshResult, output_path, *, overwrite=False) -> Path:
         f"# Faces: {len(faces)}",
     ]
 
-    for vertex in vertices:
-        lines.append("v " + " ".join(format(float(value), ".17g") for value in vertex))
+    for index, vertex in enumerate(vertices):
+        line = "v " + " ".join(format(float(value), ".17g") for value in vertex)
+        if colors is not None:
+            # Widely supported "v x y z r g b" vertex-colour extension.
+            line += " " + " ".join(format(float(c), ".4f") for c in colors[index])
+        lines.append(line)
 
     for face in faces:
         lines.append("f " + " ".join(str(int(index) + 1) for index in face))
@@ -346,7 +370,7 @@ def export_stl(mesh: MeshResult, output_path, *, overwrite=False) -> Path:
     return _atomic_write(output_path, bytes(output), overwrite)
 
 
-def _build_glb(vertices, faces) -> bytes:
+def _build_glb(vertices, faces, colors=None) -> bytes:
     vertices32 = _float32_vertices(vertices)
 
     triangles = vertices32[faces].astype(np.float64)
@@ -402,6 +426,9 @@ def _build_glb(vertices, faces) -> bytes:
     position_view = add_buffer_view(positions, 34962)
     normal_view = add_buffer_view(normals, 34962)
     index_view = add_buffer_view(indices, 34963)
+    color_view = None
+    if colors is not None:
+        color_view = add_buffer_view(np.ascontiguousarray(colors, dtype="<f4"), 34962)
 
     document = {
         "asset": {
@@ -454,6 +481,31 @@ def _build_glb(vertices, faces) -> bytes:
         ],
     }
 
+    if color_view is not None:
+        document["bufferViews"].append(color_view)
+        document["accessors"].append(
+            {
+                "bufferView": len(document["bufferViews"]) - 1,
+                "componentType": 5126,
+                "count": len(positions),
+                "type": "VEC3",
+            }
+        )
+        primitive = document["meshes"][0]["primitives"][0]
+        primitive["attributes"]["COLOR_0"] = len(document["accessors"]) - 1
+        primitive["material"] = 0
+        document["materials"] = [
+            {
+                "name": "Img2Mesh Vertex Colour",
+                "pbrMetallicRoughness": {
+                    "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+                    "metallicFactor": 0.0,
+                    "roughnessFactor": 0.85,
+                },
+                "doubleSided": False,
+            }
+        ]
+
     json_chunk = json.dumps(
         document,
         separators=(",", ":"),
@@ -479,7 +531,8 @@ def _build_glb(vertices, faces) -> bytes:
 
 def export_glb(mesh: MeshResult, output_path, *, overwrite=False) -> Path:
     vertices, faces = _prepare_mesh(mesh)
-    data = _build_glb(vertices, faces)
+    colors = _prepare_colors(mesh, len(vertices))
+    data = _build_glb(vertices, faces, colors)
     return _atomic_write(output_path, data, overwrite)
 
 

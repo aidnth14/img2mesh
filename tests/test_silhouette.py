@@ -108,8 +108,10 @@ def test_reconstruct_visual_hull_achieves_high_model_to_image_accuracy(tmp_path)
         intrinsics=intrinsics,
         resolution=48,
         carve_concavity=False,
+        shape_prior="none",
     )
 
+    assert result.method == "visual_hull"
     assert result.mean_iou >= 0.90
     assert result.min_iou >= 0.85
     assert result.mean_dice >= 0.94
@@ -151,3 +153,20 @@ def test_cli_silhouette_and_auto_modes(tmp_path):
     code = cli.main([str(tmp_path), str(out_sil), "--mode", "silhouette"])
     assert code == cli.EXIT_SUCCESS
     assert out_sil.is_file() and out_sil.stat().st_size > 0
+
+
+def test_cli_shape_prior_option(tmp_path):
+    images, _, _ = _make_synthetic_cup_views()
+    for idx, image in enumerate(images):
+        image.save(tmp_path / f"view_{idx:02d}.png")
+
+    assert cli.build_parser().parse_args(["a", "b.glb"]).shape_prior == "auto"
+    out = tmp_path / "hull.obj"
+    code = cli.main(
+        [str(tmp_path), str(out), "--mode", "silhouette", "--shape-prior", "none"]
+    )
+    assert code == cli.EXIT_SUCCESS
+    first_vertex = next(
+        line for line in out.read_text().splitlines() if line.startswith("v ")
+    )
+    assert len(first_vertex.split()) == 4  # plain hull carries no colours
