@@ -68,6 +68,32 @@ def extract_features(
 
     keypoints, descriptors = detector.detectAndCompute(gray, cv_mask)
     keypoints_tuple = tuple(keypoints) if keypoints is not None else ()
+
+    if len(keypoints_tuple) < min(150, max_features // 2) and int(np.ptp(gray)) > 0:
+        enhanced = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        if normalized_method == "orb":
+            fallback = cv2.ORB_create(
+                nfeatures=max_features,
+                scaleFactor=1.15,
+                nlevels=10,
+                fastThreshold=7,
+            )
+        else:
+            fallback = cv2.SIFT_create(
+                nfeatures=max_features,
+                contrastThreshold=0.01,
+                edgeThreshold=15,
+            )
+        alt_kp, alt_desc = fallback.detectAndCompute(enhanced, cv_mask)
+        if alt_kp is not None and len(alt_kp) > len(keypoints_tuple):
+            keypoints_tuple = tuple(alt_kp)
+            descriptors = alt_desc
+
+    if len(keypoints_tuple) > max_features:
+        keypoints_tuple = keypoints_tuple[:max_features]
+        if descriptors is not None:
+            descriptors = descriptors[:max_features]
+
     if not keypoints_tuple:
         descriptors = None
 

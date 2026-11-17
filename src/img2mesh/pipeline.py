@@ -683,6 +683,7 @@ def reconstruct_image_set(
     pnp_min_inliers=6,
     run_bundle_adjustment=True,
     bundle_adjustment_max_nfev=200,
+    require_all_cameras=False,
 ):
     images = tuple(images)
 
@@ -786,17 +787,19 @@ def reconstruct_image_set(
             break
 
         if not registered:
-            raise ReconstructionError(
-                "Could not register every camera. A remaining image needs "
-                "more reliable 2D-3D feature correspondences."
-            )
+            if require_all_cameras:
+                raise ReconstructionError(
+                    "Could not register every camera. A remaining image needs "
+                    "more reliable 2D-3D feature correspondences."
+                )
+            break
 
         _add_triangulated_tracks(graph, intrinsics, poses, lookup, points_by_track)
 
     order = (
         seed[0],
         seed[1],
-        *(view for view in range(len(images)) if view not in seed),
+        *(view for view in range(len(images)) if view in poses and view not in seed),
     )
     camera_index = {view: index for index, view in enumerate(order)}
 
