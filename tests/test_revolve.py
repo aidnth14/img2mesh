@@ -5,7 +5,12 @@ from scipy.spatial.transform import Rotation
 
 from img2mesh.config import ConfigurationError, ReconstructionError
 from img2mesh.geometry import CameraIntrinsics
-from img2mesh.revolve import analyze_view, is_surface_of_revolution, taubin_smooth
+from img2mesh.revolve import (
+    analyze_view,
+    camera_elevation,
+    is_surface_of_revolution,
+    taubin_smooth,
+)
 from img2mesh.silhouette import reconstruct_visual_hull
 
 HEIGHT = 0.8
@@ -114,8 +119,8 @@ def test_analyze_view_recovers_elevation_and_handle(cup_views):
     _, masks, _ = cup_views
     analyses = [analyze_view(m) for m in masks]
     for (_, el), analysis in zip(VIEWS, analyses, strict=True):
-        # Steep views only seed the pose search, so a looser bound suffices.
-        tolerance = 7.0 if el <= 35.0 else 20.0
+        # These estimates only seed the camera fit (checked separately).
+        tolerance = 10.0 if el <= 35.0 else 20.0
         assert analysis.elevation_deg == pytest.approx(el, abs=tolerance)
         assert analysis.handle_side == 1
     assert is_surface_of_revolution(analyses)
@@ -132,6 +137,12 @@ def test_auto_prior_rebuilds_hollow_cup_with_handle(cup_result):
     assert result.method == "revolution"
     assert result.mean_iou >= 0.92
     assert result.min_iou >= 0.88
+
+    # Fitted cameras recover the true elevations (near-top views are least
+    # constrained: their outline barely changes with elevation).
+    for (_, el), rotvec in zip(VIEWS, result.camera_rotations, strict=True):
+        fitted = camera_elevation(Rotation.from_rotvec(rotvec).as_matrix())
+        assert fitted == pytest.approx(el, abs=10.0 if el < 60 else 15.0)
 
     counts = _edge_counts(mesh.faces)
     assert np.all(counts == 2), "mesh must be closed and manifold"

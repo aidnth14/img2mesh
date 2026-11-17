@@ -390,7 +390,10 @@ def marching_tetrahedra(
     safe = np.abs(denom) > 1e-12
     alpha = np.full(len(unique_keys), 0.5)
     alpha[safe] = (level - v0[first][safe]) / denom[safe]
-    alpha = np.clip(alpha, 0.0, 1.0)
+    # Keep vertices a hair off grid corners: corner values within ~1e-7 of
+    # the level otherwise give near-zero-area triangles whose removal below
+    # would punch holes in the otherwise closed surface.
+    alpha = np.clip(alpha, 1e-4, 1.0 - 1e-4)
     p0 = corner_xyz(f0[first])
     p1 = corner_xyz(f1[first])
     vertices = p0 + alpha[:, None] * (p1 - p0)

@@ -16,7 +16,7 @@ of a product shot) rarely provide. This module instead:
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -32,8 +32,18 @@ from .image import largest_component
 
 PROFILE_SAMPLES = 160
 SIDE_VIEW_MAX_ELEVATION = 25.0
-TOP_VIEW_MIN_ELEVATION = 70.0
+TOP_VIEW_MIN_ELEVATION = 60.0
 _Y_UP_TO_CAMERA = np.diag([1.0, -1.0, -1.0])
+
+
+@dataclass(frozen=True, slots=True)
+class Appendage:
+    """A handle, spout or similar part sticking out of the revolved body."""
+
+    mask: np.ndarray
+    side: int  # +1: image right of the axis, -1: left
+    area: int
+    reach_px: float  # how far it extends beyond the body radius
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,16 +51,35 @@ class ViewAnalysis:
     mask: np.ndarray
     body: np.ndarray
     axis_x: float
-    handle_side: int
-    handle_area: int
+    appendages: tuple[Appendage, ...]
     elevation_deg: float
     rim_y: float
     foot_y: float
-    diameter_px: float
-    free_radius: np.ndarray
-    symmetry_error: float
+    diameter_px: float  # topmost circle (rim, lip, cap or knob)
+    scale_px: float  # widest body diameter: the unit for profile and height
+    radius: np.ndarray  # symmetric body half-width per row (NaN if none)
+    mirror_iou: float
+    top_aspect: float | None
     profile: np.ndarray | None
     height_ratio: float | None
+    rim_radius_px: float = 0.0
+    bottom_y: float = 0.0
+
+    @property
+    def handle_side(self) -> int:
+        return self.appendages[0].side if self.appendages else 0
+
+    @property
+    def handle_area(self) -> int:
+        return self.appendages[0].area if self.appendages else 0
+
+    @property
+    def symmetry_error(self) -> float:
+        return 1.0 - self.mirror_iou
+
+    @property
+    def free_radius(self) -> np.ndarray:
+        return self.radius
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,17 +92,11 @@ class RevolutionModel:
     profile: np.ndarray
     height_ratio: float
     hollow: bool
-    has_handle: bool
+    appendage_count: int
 
-
-def _row_edges(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    any_row = mask.any(axis=1)
-    width = mask.shape[1]
-    left = np.where(any_row, np.argmax(mask, axis=1), -1).astype(np.float64)
-    right = np.where(any_row, width - 1 - np.argmax(mask[:, ::-1], axis=1), -1).astype(
-        np.float64
-    )
-    return left, right
+    @property
+    def has_handle(self) -> bool:
+        return self.appendage_count > 0
 
 
 def _body_mask(mask: np.ndarray) -> np.ndarray:
@@ -87,188 +110,329 @@ def _body_mask(mask: np.ndarray) -> np.ndarray:
     return body if body.any() else mask.copy()
 
 
-def analyze_view(mask: np.ndarray) -> ViewAnalysis:
-    """Measure axis, handle side, elevation and outer profile of one view."""
-    mask = np.asarray(mask) > 0
-    height = mask.shape[0]
-    body = _body_mask(mask)
+def _mirror_iou(body: np.ndarray, axis_x: float) -> float:
+    ys, xs = np.nonzero(body)
+    mirrored = np.round(2.0 * axis_x - xs).astype(np.int64)
+    inside = (mirrored >= 0) & (mirrored < body.shape[1])
+    inter = np.count_nonzero(body[ys[inside], mirrored[inside]])
+    return float(inter / max(2 * len(xs) - inter, 1))
 
-    body_rows = np.flatnonzero(body.any(axis=1))
-    lo, hi = body_rows[0], body_rows[-1]
-    core = body_rows[
-        (body_rows >= lo + 0.2 * (hi - lo)) & (body_rows <= hi - 0.2 * (hi - lo))
-    ]
+
+def _fit_axis(body: np.ndarray) -> tuple[float, float]:
+    """Vertical mirror axis maximising the body's left/right overlap."""
+    rows = np.flatnonzero(body.any(axis=1))
+    lo, hi = rows[0], rows[-1]
+    core = rows[(rows >= lo + 0.2 * (hi - lo)) & (rows <= hi - 0.2 * (hi - lo))]
     if len(core) == 0:
-        core = body_rows
-    b_left, b_right = _row_edges(body)
-    axis_x = float(np.median(0.5 * (b_left[core] + b_right[core])))
+        core = rows
+    sub = body[core]
+    left = np.argmax(sub, axis=1)
+    right = sub.shape[1] - 1 - np.argmax(sub[:, ::-1], axis=1)
+    guess = float(np.median(0.5 * (left + right)))
+    width = float(np.median(right - left)) + 1.0
+    best = (-1.0, guess)
+    for offset in np.arange(-0.05 * width, 0.05 * width + 0.25, 0.5):
+        score = _mirror_iou(body, guess + offset)
+        if score > best[0]:
+            best = (score, guess + offset)
+    return best[1], best[0]
 
-    grown = cv2.dilate(body.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
-    handle = mask & ~grown
-    if handle.any():
-        handle = largest_component(handle.astype(np.uint8) * 255) > 0
-    hy, hx = np.nonzero(handle)
-    handle_area = int(len(hx))
-    handle_side = 0
-    if handle_area > 0.01 * np.count_nonzero(mask):
-        handle_side = 1 if float(np.mean(hx)) > axis_x else -1
-    else:
-        handle_area = 0
 
-    left, right = _row_edges(mask)
-    valid = left >= 0
-    r_left = np.where(valid, axis_x - left, np.nan)
-    r_right = np.where(valid, right - axis_x, np.nan)
-    if handle_side > 0:
-        free, other = r_left, r_right
-    elif handle_side < 0:
-        free, other = r_right, r_left
-    else:
-        free = 0.5 * (r_left + r_right)
-        other = free
+def _symmetric_radius(mask: np.ndarray, axis_x: float) -> np.ndarray:
+    """Per-row half-width of the solid run through the axis (shorter side).
 
-    handle_rows = np.zeros(height, dtype=bool)
-    if handle_area:
-        pad = max(3, int(0.03 * height))
-        handle_rows[max(0, hy.min() - pad) : min(height, hy.max() + pad + 1)] = True
-        if handle_side > 0:
-            r_right_full = np.where(valid, right - axis_x, np.nan)
-            other = np.where(handle_rows, np.nan, r_right_full)
+    Taking the shorter side ignores a handle or spout attached on one side;
+    using only the run through the axis ignores parts beyond a gap (a
+    handle seen through its hole).
+    """
+    ax = int(np.clip(round(axis_x), 0, mask.shape[1] - 1))
+    on_axis = mask[:, ax]
+    left_part = mask[:, : ax + 1][:, ::-1]
+    right_part = mask[:, ax:]
+    len_l = np.where(
+        left_part.all(axis=1), left_part.shape[1], np.argmin(left_part, axis=1)
+    )
+    len_r = np.where(
+        right_part.all(axis=1), right_part.shape[1], np.argmin(right_part, axis=1)
+    )
+    r_left = axis_x - (ax - len_l + 0.5)
+    r_right = (ax + len_r - 0.5) - axis_x
+    radius = np.minimum(r_left, r_right).astype(np.float64)
+    radius[~on_axis] = np.nan
+    return radius
+
+
+def _find_appendages(
+    mask: np.ndarray, axis_x: float, radius: np.ndarray
+) -> tuple[Appendage, ...]:
+    h, w = mask.shape
+    xx = np.arange(w)[None, :]
+    reach = np.abs(xx - axis_x)
+    r_row = np.where(np.isfinite(radius), radius, -1.0)[:, None]
+    outside = mask & (reach > r_row + 1.5)
+    outside = cv2.morphologyEx(
+        outside.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
+    )
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(outside, 8)
+    min_area = max(30, int(0.004 * np.count_nonzero(mask)))
+    found = []
+    for label in range(1, count):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < min_area:
+            continue
+        comp = labels == label
+        if distance_transform_edt(comp).max() < 2.0:
+            continue  # a sliver along the body edge, not a part
+        cy, cx = np.nonzero(comp)
+        side = 1 if float(np.mean(cx)) > axis_x else -1
+        base = np.nanmedian(np.where(np.isfinite(radius[cy]), radius[cy], np.nan))
+        base = 0.0 if not np.isfinite(base) else float(base)
+        found.append(
+            Appendage(
+                mask=comp,
+                side=side,
+                area=area,
+                reach_px=float(np.max(np.abs(cx - axis_x))) - base,
+            )
+        )
+    found.sort(key=lambda app: -app.area)
+    return tuple(found)
+
+
+def _lip_ellipse(radius: np.ndarray, top_axis: float) -> tuple[float, float, float]:
+    """Topmost circle's image ellipse: (centre row, semi-minor, radius).
+
+    Walking down from the top, the half-width grows along the far half of the
+    topmost circle (a rim, lip, cap or knob) until that circle's widest row,
+    after which it shrinks (a neck) or stops growing (a wall or knob side).
+    A well-resolved ellipse is fitted as ``y = yc - b * sqrt(1 - (r / R)^2)``
+    over the rising rows; a thin one (near side-on) is measured directly as
+    the drop from the top of the outline to the widest row.
+    """
+    rows = np.flatnonzero(np.isfinite(radius))
+    r = radius[rows]
+    peak, stall, peak_row = -np.inf, 0, rows[0]
+    for row, value in zip(rows, r, strict=True):
+        if value > peak + 0.5:
+            stall, peak_row = 0, row
         else:
-            r_left_full = np.where(valid, axis_x - left, np.nan)
-            other = np.where(handle_rows, np.nan, r_left_full)
+            stall += 1
+        peak = max(peak, value)
+        shrinking = value < peak - max(1.5, 0.02 * peak)
+        if shrinking or stall >= max(4, int(np.ceil(np.sqrt(peak))) + 1):
+            break
+    # Only rows up to the last real widening belong to the topmost circle;
+    # a slightly wider row further down a near-cylindrical wall does not.
+    segment = rows <= peak_row + 2
+    rim_r = max(float(r[segment].max()), 1.0)
+    first_row = int(rows[segment][np.argmax(r[segment] >= rim_r - 0.5)])
+    sag = float(max(first_row - top_axis, 0.0))
+    rising = (rows <= first_row) & (r > 0.05 * rim_r) & (r < 0.97 * rim_r)
+    if np.count_nonzero(rising) >= 6:
+        s = np.sqrt(1.0 - (r[rising] / rim_r) ** 2)
+        design = np.column_stack((np.ones_like(s), -s))
+        (yc, b), *_ = np.linalg.lstsq(design, rows[rising].astype(float), rcond=None)
+        if b > 0:
+            return float(yc), float(min(b, rim_r)), rim_r
+    return float(first_row), min(sag, rim_r), rim_r
 
-    rows = np.flatnonzero(valid)
+
+def _top_aspect(body: np.ndarray) -> float | None:
+    contours, _ = cv2.findContours(
+        body.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+    )
+    if not contours:
+        return None
+    contour = max(contours, key=cv2.contourArea)
+    if len(contour) < 5:
+        return None
+    (_, _), (a, b), _ = cv2.fitEllipse(contour)
+    return float(min(a, b) / max(a, b, 1e-9))
+
+
+def _measure_profile(
+    radius: np.ndarray,
+    rim_y: float,
+    rim_r: float,
+    bottom_axis: float,
+    elevation: float,
+) -> tuple[float, float, np.ndarray | None, float | None]:
+    """Foot row, body scale, normalised profile and height for an elevation.
+
+    The outline's lowest point is the near edge of the foot circle, so the
+    foot's own row sits ``r_foot * sin(el)`` above it; heights shrink by
+    ``cos(el)``. Profiles are only taken from near side-on views.
+    """
+    sin_el = float(np.sin(np.radians(elevation)))
+    rows = np.flatnonzero(np.isfinite(radius))
     top, bottom = rows[0], rows[-1]
-    upper = rows[rows <= top + 0.5 * (bottom - top)]
-    r_max = float(np.nanmax(free[upper]))
-
-    # The top outline across the rim is the far half of the rim ellipse:
-    # T(x) = rim_y - b * sqrt(1 - ((x - axis) / R)^2), with b = R sin(el).
-    # Near the rim ends the outline is steep, so a pixel of axis or radius
-    # error biases the fit; search small offsets of both alongside it.
-    width = mask.shape[1]
-    cols_x = np.arange(width, dtype=np.float64)
-    top_edge = np.argmax(mask, axis=0).astype(np.float64)
-    any_col = mask.any(axis=0)
-    best_fit = (np.inf, float(top), 0.0, r_max)
-    for dx in np.arange(-2.0, 2.01, 0.5):
-        for dr in np.arange(-2.0, 2.01, 0.5):
-            radius = max(r_max + dr, 1.0)
-            u = (cols_x - axis_x - dx) / radius
-            has = any_col & (np.abs(u) < 0.95)
-            if np.count_nonzero(has) < 5:
-                continue
-            s = np.sqrt(1.0 - u[has] ** 2)
-            design = np.column_stack((np.ones_like(s), -s))
-            coef, *_ = np.linalg.lstsq(design, top_edge[has], rcond=None)
-            resid = float(np.mean((design @ coef - top_edge[has]) ** 2))
-            if resid < best_fit[0]:
-                best_fit = (resid, float(coef[0]), float(coef[1]), radius)
-    _, rim_y, semi_minor, fit_radius = best_fit
-    rim_y = float(np.clip(rim_y, top, bottom))
-    sin_el = float(np.clip(semi_minor / fit_radius, 0.0, 1.0))
-    elevation = float(np.degrees(np.arcsin(sin_el)))
-    rim_r = free[int(round(rim_y))]
-    diameter = 2.0 * float(rim_r if np.isfinite(rim_r) else r_max)
-
-    ax = int(round(axis_x))
-    band = slice(max(0, ax - max(2, int(0.1 * r_max))), ax + max(3, int(0.1 * r_max)))
-    col_rows = np.flatnonzero(mask[:, band].any(axis=1))
-    bottom_axis = float(col_rows[-1])
-
     foot_y = bottom_axis
     for _ in range(3):
         probe = int(np.clip(round(foot_y), top, bottom))
-        r_foot = float(np.nan_to_num(free[probe], nan=0.0))
+        r_foot = float(np.nan_to_num(radius[probe], nan=0.0))
         foot_y = bottom_axis - r_foot * sin_el
 
-    both = np.isfinite(free) & np.isfinite(other)
-    both[: int(rim_y) + 1] = False
-    both[int(foot_y) :] = False
-    if np.count_nonzero(both) > 5:
-        symmetry_error = float(
-            np.median(np.abs(free[both] - other[both])) / max(diameter, 1.0)
-        )
-    else:
-        symmetry_error = 0.0
+    body_rows = np.arange(int(np.ceil(rim_y)), int(np.floor(foot_y)) + 1)
+    body_r = radius[body_rows] if len(body_rows) else np.array([])
+    widest = float(np.nanmax(body_r)) if np.isfinite(body_r).any() else rim_r
+    scale = 2.0 * max(widest, rim_r)
 
     profile = None
     height_ratio = None
     if elevation <= SIDE_VIEW_MAX_ELEVATION and foot_y - rim_y > 4:
-        ys = np.arange(int(np.ceil(rim_y)), int(np.floor(foot_y)) + 1)
-        rs = free[ys]
-        ok = np.isfinite(rs)
+        ok = np.isfinite(body_r)
         if np.count_nonzero(ok) > 4:
-            ts = (ys[ok] - rim_y) / (foot_y - rim_y)
+            ts = (body_rows[ok] - rim_y) / (foot_y - rim_y)
             samples = np.linspace(0.0, 1.0, PROFILE_SAMPLES)
-            profile = np.interp(samples, ts, rs[ok]) / diameter
+            profile = np.interp(samples, ts, body_r[ok]) / scale
             cos_el = max(np.cos(np.radians(elevation)), 0.2)
-            height_ratio = float((foot_y - rim_y) / cos_el / diameter)
+            height_ratio = float((foot_y - rim_y) / cos_el / scale)
+    return float(foot_y), scale, profile, height_ratio
 
-    return ViewAnalysis(
-        mask=mask,
-        body=body,
-        axis_x=axis_x,
-        handle_side=handle_side,
-        handle_area=handle_area,
-        elevation_deg=elevation,
-        rim_y=rim_y,
-        foot_y=float(foot_y),
-        diameter_px=diameter,
-        free_radius=free,
-        symmetry_error=symmetry_error,
+
+def with_elevation(view: ViewAnalysis, elevation: float) -> ViewAnalysis:
+    """Re-measure a view's foot, profile and height for a known elevation."""
+    foot_y, scale, profile, height_ratio = _measure_profile(
+        view.radius, view.rim_y, view.rim_radius_px, view.bottom_y, elevation
+    )
+    return replace(
+        view,
+        elevation_deg=float(elevation),
+        foot_y=foot_y,
+        scale_px=scale,
         profile=profile,
         height_ratio=height_ratio,
     )
 
 
-def _circularity(mask: np.ndarray) -> float:
-    contours, _ = cv2.findContours(
-        mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+def analyze_view(mask: np.ndarray) -> ViewAnalysis:
+    """Measure axis, appendages, elevation and outer profile of one view."""
+    mask = np.asarray(mask) > 0
+    body = _body_mask(mask)
+    axis_x, mirror = _fit_axis(body)
+
+    radius = _symmetric_radius(mask, axis_x)
+    appendages = _find_appendages(mask, axis_x, radius)
+    sides = {app.side for app in appendages}
+    if sides == {-1, 1}:
+        # Parts attached on both sides of the same rows inflate both halves;
+        # only there, fall back to the part-free (opened) body.
+        rows_by_side = {
+            side: np.any(
+                [app.mask.any(axis=1) for app in appendages if app.side == side],
+                axis=0,
+            )
+            for side in (-1, 1)
+        }
+        both = rows_by_side[-1] & rows_by_side[1]
+        body_radius = _symmetric_radius(body, axis_x)
+        width = float(np.nanmax(radius)) if np.isfinite(radius).any() else 1.0
+        tol = max(3.0, 0.04 * width)
+        inflated = both & np.isfinite(body_radius) & (radius > body_radius + tol)
+        if inflated.any():
+            radius = np.where(inflated, body_radius, radius)
+            appendages = _find_appendages(mask, axis_x, radius)
+
+    ax = int(round(axis_x))
+    band = slice(max(0, ax - 2), ax + 3)
+    col_rows = np.flatnonzero(mask[:, band].any(axis=1))
+    top_axis, bottom_axis = float(col_rows[0]), float(col_rows[-1])
+
+    rim_y, semi_minor, rim_r = _lip_ellipse(radius, top_axis)
+    sin_el = float(np.clip(semi_minor / rim_r, 0.0, 1.0))
+    elevation = float(np.degrees(np.arcsin(sin_el)))
+    diameter = 2.0 * rim_r
+
+    foot_y, scale, profile, height_ratio = _measure_profile(
+        radius, rim_y, rim_r, bottom_axis, elevation
     )
-    if not contours:
-        return 0.0
-    contour = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(contour)
-    perimeter = cv2.arcLength(contour, True)
-    return float(4.0 * np.pi * area / max(perimeter * perimeter, 1e-9))
+
+    return ViewAnalysis(
+        mask=mask,
+        body=body,
+        axis_x=axis_x,
+        appendages=appendages,
+        elevation_deg=elevation,
+        rim_y=rim_y,
+        foot_y=float(foot_y),
+        diameter_px=diameter,
+        scale_px=scale,
+        radius=radius,
+        mirror_iou=mirror,
+        top_aspect=_top_aspect(body) if elevation >= 60.0 else None,
+        rim_radius_px=rim_r,
+        bottom_y=bottom_axis,
+        profile=profile,
+        height_ratio=height_ratio,
+    )
 
 
 def is_surface_of_revolution(analyses: Sequence[ViewAnalysis]) -> bool:
-    """Heuristic check that the views show one rotationally symmetric body."""
+    """Heuristic check that the views show one rotationally symmetric body.
+
+    Requires a side-on view; left/right mirror symmetry of the (appendage
+    free) body in every view; side views that agree on height/diameter
+    (a box's width changes with azimuth, a cup's does not); and a round
+    outline from any top-down view.
+    """
     side = [a for a in analyses if a.profile is not None]
     if not side:
         return False
-    if np.median([a.symmetry_error for a in side]) > 0.035:
+    mirrors = [a.mirror_iou for a in analyses]
+    if np.median(mirrors) < 0.93 or min(mirrors) < 0.88:
         return False
-    for a in analyses:
-        if a.elevation_deg >= TOP_VIEW_MIN_ELEVATION and _circularity(a.body) < 0.8:
+    heights = [a.height_ratio for a in side]
+    if len(heights) >= 2:
+        spread = (max(heights) - min(heights)) / max(float(np.median(heights)), 1e-9)
+        if spread > 0.15:
             return False
+    for a in analyses:
+        if a.elevation_deg >= TOP_VIEW_MIN_ELEVATION:
+            if a.top_aspect is None or a.top_aspect < 0.85:
+                return False
     return True
 
 
 def _detect_open_top(
     analyses: Sequence[ViewAnalysis], grays: Sequence[np.ndarray]
 ) -> bool:
-    best = None
-    for a, gray in zip(analyses, grays, strict=True):
-        if a.elevation_deg < 20.0:
+    """Is the top open (a cup, bowl or vase) rather than closed (a lid, cap)?
+
+    Seen from about 30 degrees up, an open vessel shows its shaded far inner
+    wall and floor inside the rim ellipse, darker than the lit rim band; a
+    closed top faces the light and is as bright or brighter. Top-down views
+    are poor judges (the band there includes grazing outer wall), so views
+    between 12 and 45 degrees are averaged, weighted towards 30 degrees.
+    """
+    candidates = [
+        (a, gray)
+        for a, gray in zip(analyses, grays, strict=True)
+        if 12.0 <= a.elevation_deg <= 45.0
+    ]
+    if not candidates:
+        elevated = [
+            (a, gray)
+            for a, gray in zip(analyses, grays, strict=True)
+            if a.elevation_deg >= 12.0
+        ]
+        if not elevated:
+            return False
+        candidates = [min(elevated, key=lambda c: abs(c[0].elevation_deg - 30.0))]
+    margins, weights = [], []
+    for a, gray in candidates:
+        radius = 0.5 * a.diameter_px
+        semi_minor = max(radius * np.sin(np.radians(a.elevation_deg)), 2.0)
+        yy, xx = np.mgrid[0 : gray.shape[0], 0 : gray.shape[1]]
+        ell = ((xx - a.axis_x) / radius) ** 2 + ((yy - a.rim_y) / semi_minor) ** 2
+        inner = (ell < 0.55**2) & a.mask
+        rim = (ell > 0.92**2) & (ell < 1.0) & a.mask
+        if np.count_nonzero(inner) < 20 or np.count_nonzero(rim) < 20:
             continue
-        if best is None or a.elevation_deg > best[0].elevation_deg:
-            best = (a, gray)
-    if best is None:
+        margins.append(float(np.median(gray[rim])) - float(np.median(gray[inner])))
+        weights.append(1.0 / (1.0 + abs(a.elevation_deg - 30.0) / 10.0))
+    if not margins:
         return False
-    a, gray = best
-    radius = 0.5 * a.diameter_px
-    semi_minor = max(radius * np.sin(np.radians(a.elevation_deg)), 2.0)
-    yy, xx = np.mgrid[0 : gray.shape[0], 0 : gray.shape[1]]
-    ell = ((xx - a.axis_x) / radius) ** 2 + ((yy - a.rim_y) / semi_minor) ** 2
-    inner = (ell < 0.55**2) & a.mask
-    rim = (ell > 0.92**2) & (ell < 1.0) & a.mask
-    if np.count_nonzero(inner) < 20 or np.count_nonzero(rim) < 20:
-        return False
-    return float(np.median(gray[inner])) < float(np.median(gray[rim])) - 5.0
+    return float(np.average(margins, weights=weights)) > 5.0
 
 
 def _smooth_max(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
@@ -342,38 +506,40 @@ def _local_thickness(inside: np.ndarray, depth: np.ndarray) -> np.ndarray:
 
 
 class _HandleField:
-    """Swept-tube signed distance built from the in-plane handle silhouette."""
+    """Swept-tube signed distance built from one appendage's silhouette.
+
+    World +X is image right in the view the appendage was measured in, so
+    parts on both sides of the body share one frame.
+    """
 
     def __init__(
         self,
         view: ViewAnalysis,
+        appendage: Appendage,
         height: float,
         wall: float,
         depth_scale: float | None,
     ) -> None:
         mask = view.mask
         h, w = mask.shape
-        side = view.handle_side
+        side = appendage.side
         xx = np.arange(w)[None, :]
         offset = side * (xx - view.axis_x)
-        free = np.nan_to_num(view.free_radius, nan=0.0)[:, None]
+        free = np.nan_to_num(view.radius, nan=0.0)[:, None]
 
-        handle = mask & (offset > free + 1.0)
-        handle = cv2.morphologyEx(
-            handle.astype(np.uint8), cv2.MORPH_OPEN, np.ones((3, 3), np.uint8)
-        )
-        handle = largest_component(handle * 255) > 0
-        if not handle.any():
-            raise ReconstructionError("Handle silhouette could not be isolated.")
+        part = appendage.mask
+        if not part.any():
+            raise ReconstructionError("Appendage silhouette is empty.")
 
-        d_px = view.diameter_px
-        hy = np.flatnonzero(handle.any(axis=1))
-        depth0 = distance_transform_edt(handle)
+        d_px = view.scale_px
+        hy = np.flatnonzero(part.any(axis=1))
+        depth0 = distance_transform_edt(part)
         pad = int(np.ceil(depth0.max())) + 2
         rows = np.zeros(h, dtype=bool)
         rows[max(0, hy[0] - pad) : min(h, hy[-1] + pad + 1)] = True
         strip = mask & (offset > free - 2.0 * wall * d_px) & rows[:, None]
-        support = handle | strip
+        strip &= offset > 0
+        support = part | strip
 
         depth_in = distance_transform_edt(support)
         thickness = _local_thickness(support, depth_in)
@@ -382,12 +548,12 @@ class _HandleField:
         self.ecc = np.where(support, thickness - depth_in, rho + depth_out) / d_px
         self.rho = rho / d_px
 
-        medial = handle & (depth0 >= 0.8 * thickness)
-        rho_handle = float(np.median(thickness[medial])) / d_px if medial.any() else 0.0
-        if depth_scale is None or rho_handle <= 0:
+        medial = part & (depth0 >= 0.8 * thickness)
+        rho_part = float(np.median(thickness[medial])) / d_px if medial.any() else 0.0
+        if depth_scale is None or rho_part <= 0:
             self.k = 1.0
         else:
-            self.k = float(np.clip(0.5 * depth_scale / rho_handle, 0.6, 2.5))
+            self.k = float(np.clip(0.5 * depth_scale / rho_part, 0.6, 2.5))
 
         self.axis_x = view.axis_x
         self.side = side
@@ -395,19 +561,16 @@ class _HandleField:
         self.rim_y = view.rim_y
         self.foot_y = view.foot_y
         self.height = height
-        hx = np.nonzero(handle)[1]
-        self.reach = float(np.max(side * (hx - view.axis_x))) / d_px
-        ys_h = np.nonzero(handle)[0]
-        self.y_range = (self._world_y(ys_h.max()), self._world_y(ys_h.min()))
-        self.thickness = rho_handle
-
-    def _world_y(self, py: float) -> float:
-        return float(
-            self.height * (self.foot_y - py) / max(self.foot_y - self.rim_y, 1.0)
+        px_x = np.nonzero(part)[1]
+        self.extent = (
+            float(np.min(px_x - view.axis_x)) / d_px,
+            float(np.max(px_x - view.axis_x)) / d_px,
         )
+        self.reach = appendage.reach_px / d_px
+        self.thickness = rho_part
 
     def sample(self, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> np.ndarray:
-        px = self.axis_x + self.side * x * self.d_px
+        px = self.axis_x + x * self.d_px
         py = self.foot_y - y / self.height * (self.foot_y - self.rim_y)
         coords = np.vstack((py, px))
         ecc = map_coordinates(self.ecc, coords, order=1, mode="nearest")
@@ -415,32 +578,39 @@ class _HandleField:
         return np.sqrt(ecc * ecc + (z / self.k) ** 2) - rho
 
 
-def _top_view_handle_depth(view: ViewAnalysis) -> float | None:
-    """Out-of-plane handle width (in rim diameters) seen from above."""
+def _top_view_widths(view: ViewAnalysis) -> list[tuple[float, float]]:
+    """(reach, out-of-plane width) per part seen from above, in diameters."""
     body = view.body
     ys, xs = np.nonzero(body)
     center = np.array([xs.mean(), ys.mean()])
     radius = float(np.sqrt(len(xs) / np.pi))
-    my, mx = np.nonzero(view.mask)
-    pts = np.column_stack((mx, my)).astype(np.float64)
-    dist = np.linalg.norm(pts - center, axis=1)
-    outside = pts[dist > 1.1 * radius]
-    if len(outside) < 30:
-        return None
-    direction = outside.mean(axis=0) - center
-    direction /= max(np.linalg.norm(direction), 1e-9)
-    perp = np.array([-direction[1], direction[0]])
-    along = (outside - center) @ direction
-    across = (outside - center) @ perp
-    bins = np.round(along).astype(int)
-    widths = []
-    for b in np.unique(bins):
-        sel = across[bins == b]
-        if len(sel) > 1:
-            widths.append(float(sel.max() - sel.min() + 1.0))
-    if not widths:
-        return None
-    return float(np.median(widths)) / (2.0 * radius)
+    yy, xx = np.nonzero(view.mask)
+    dist = np.hypot(xx - center[0], yy - center[1])
+    outside = np.zeros(view.mask.shape, dtype=np.uint8)
+    sel = dist > 1.1 * radius
+    outside[yy[sel], xx[sel]] = 1
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(outside, 8)
+    parts = []
+    for label in range(1, count):
+        if stats[label, cv2.CC_STAT_AREA] < 30:
+            continue
+        cy, cx = np.nonzero(labels == label)
+        pts = np.column_stack((cx, cy)).astype(np.float64) - center
+        direction = pts.mean(axis=0)
+        direction /= max(np.linalg.norm(direction), 1e-9)
+        perp = np.array([-direction[1], direction[0]])
+        along = pts @ direction
+        across = pts @ perp
+        bins = np.round(along).astype(int)
+        widths = [
+            float(across[bins == b].max() - across[bins == b].min() + 1.0)
+            for b in np.unique(bins)
+            if np.count_nonzero(bins == b) > 1
+        ]
+        if widths:
+            reach = (float(along.max()) - radius) / (2.0 * radius)
+            parts.append((reach, float(np.median(widths)) / (2.0 * radius)))
+    return parts
 
 
 def _smooth_min(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
@@ -450,37 +620,55 @@ def _smooth_min(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
     return b * (1.0 - h) + a * h - k * h * (1.0 - h)
 
 
+class _FieldGrid:
+    """Sampling grid for the model's signed distance, body terms cached."""
+
+    def __init__(
+        self,
+        body: _BodyField,
+        parts: Sequence[_HandleField],
+        height: float,
+        r_out: float,
+        resolution: int,
+        wall: float,
+    ) -> None:
+        margin = 0.04 + 2.0 * wall
+        x_lo = min([-r_out] + [p.extent[0] for p in parts]) - margin
+        x_hi = max([r_out] + [p.extent[1] for p in parts]) + margin
+        self.lo = np.array([x_lo, -margin, -r_out - margin])
+        hi = np.array([x_hi, height + margin, r_out + margin])
+        self.voxel = float(np.max(hi - self.lo)) / (resolution - 1)
+        self.shape = np.ceil((hi - self.lo) / self.voxel).astype(int) + 1
+        axes = [self.lo[i] + self.voxel * np.arange(self.shape[i]) for i in range(3)]
+        gx, gy, gz = np.meshgrid(*axes, indexing="ij")
+        self.x, self.y, self.z = gx.ravel(), gy.ravel(), gz.ravel()
+        radial = np.hypot(self.x, self.z)
+        self.body_sdf = body.sample(radial, self.y)
+        self.cavity = body.sample_cavity(radial, self.y)
+        self.wall = wall
+
+    def mesh(self, parts: Sequence[_HandleField]) -> tuple[np.ndarray, np.ndarray]:
+        from .silhouette import marching_tetrahedra
+
+        sdf = self.body_sdf
+        for part in parts:
+            sdf = _smooth_min(sdf, part.sample(self.x, self.y, self.z), 0.6 * self.wall)
+        if parts and self.cavity is not None:
+            # Cut after blending so the fillet never grows into the cavity.
+            sdf = np.maximum(sdf, -self.cavity)
+        field = np.clip(0.5 - sdf / (2.0 * self.voxel), 0.0, 1.0).reshape(self.shape)
+        return marching_tetrahedra(field, self.lo, self.voxel, level=0.5)
+
+
 def _build_mesh(
     body: _BodyField,
-    handle: _HandleField | None,
+    parts: Sequence[_HandleField],
     height: float,
     r_out: float,
     resolution: int,
     wall: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    from .silhouette import marching_tetrahedra
-
-    margin = 0.04 + 2.0 * wall
-    x_hi = max(r_out, handle.reach if handle else r_out) + margin
-    lo = np.array([-r_out - margin, -margin, -r_out - margin])
-    hi = np.array([x_hi, height + margin, r_out + margin])
-    voxel = float(np.max(hi - lo)) / (resolution - 1)
-    shape = np.ceil((hi - lo) / voxel).astype(int) + 1
-    axes = [lo[i] + voxel * np.arange(shape[i]) for i in range(3)]
-    gx, gy, gz = np.meshgrid(*axes, indexing="ij")
-    x, y, z = gx.ravel(), gy.ravel(), gz.ravel()
-    radial = np.hypot(x, z)
-
-    sdf = body.sample(radial, y)
-    if handle is not None:
-        sdf = _smooth_min(sdf, handle.sample(x, y, z), 0.6 * wall)
-        cavity = body.sample_cavity(radial, y)
-        if cavity is not None:
-            # Cut after blending so the fillet never grows into the cavity.
-            sdf = np.maximum(sdf, -cavity)
-
-    field = np.clip(0.5 - sdf / (2.0 * voxel), 0.0, 1.0).reshape(shape)
-    return marching_tetrahedra(field, lo, voxel, level=0.5)
+    return _FieldGrid(body, parts, height, r_out, resolution, wall).mesh(parts)
 
 
 def _iou(a: np.ndarray, b: np.ndarray) -> float:
@@ -502,33 +690,77 @@ def _splat(uv: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
     return img > 0
 
 
+class _ViewTarget:
+    """A view's mask cropped to a square ``grid`` for fast overlap scoring."""
+
+    def __init__(self, mask: np.ndarray, grid: int = 128) -> None:
+        ys, xs = np.nonzero(mask)
+        x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+        pad = 0.12 * max(x1 - x0, y1 - y0)
+        span = max(x1 - x0, y1 - y0) + 2 * pad
+        self.sx0, self.sy0 = int(round(x0 - pad)), int(round(y0 - pad))
+        self.size = int(np.ceil(span)) + 1
+        crop = np.zeros((self.size, self.size), dtype=np.uint8)
+        src = mask[max(self.sy0, 0) :, max(self.sx0, 0) :].astype(np.uint8)
+        dy, dx = max(-self.sy0, 0), max(-self.sx0, 0)
+        hh = min(src.shape[0], self.size - dy)
+        ww = min(src.shape[1], self.size - dx)
+        crop[dy : dy + hh, dx : dx + ww] = src[:hh, :ww]
+        self.crop = crop
+        self.grid = grid
+        self.gscale = grid / float(self.size)
+        self.target = cv2.resize(crop, (grid, grid), interpolation=cv2.INTER_AREA) > 0
+        self.bbox = (float(x0), float(x1), float(y0), float(y1))
+
+    def iou(
+        self,
+        points: np.ndarray,
+        rot: np.ndarray,
+        trans: np.ndarray,
+        intrinsics: CameraIntrinsics,
+    ) -> float:
+        cam = points @ rot.T + trans
+        z = np.maximum(cam[:, 2], 1e-6)
+        uv = np.column_stack(
+            (
+                (intrinsics.fx * cam[:, 0] / z + intrinsics.cx - self.sx0)
+                * self.gscale,
+                (intrinsics.fy * cam[:, 1] / z + intrinsics.cy - self.sy0)
+                * self.gscale,
+            )
+        )
+        return _iou(_splat(uv, (self.grid, self.grid)), self.target)
+
+
+def _looks_up(rot: np.ndarray) -> bool:
+    # Product shots look at the object from the side or above.
+    return float(rot[2, 1]) > 0.1
+
+
+def camera_elevation(rot: np.ndarray) -> float:
+    """Elevation (degrees above the horizon) of a fitted model-frame camera."""
+    forward = rot[2]  # camera z axis in model coordinates
+    return float(np.degrees(np.arcsin(np.clip(-forward[1], -1.0, 1.0))))
+
+
 def _fit_pose(
     points: np.ndarray,
     view: ViewAnalysis,
     intrinsics: CameraIntrinsics,
     *,
     grid: int = 128,
+    init: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Fit a camera pose so the model silhouette matches ``view.mask``.
 
     ``points`` must densely sample the model surface: the silhouette is
     rendered by splatting them onto a ``grid``-sized crop around the mask.
+    With ``init`` the orientation search is skipped and only refined.
     """
-    mask = view.mask
-    ys, xs = np.nonzero(mask)
-    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
-    pad = 0.12 * max(x1 - x0, y1 - y0)
-    span = max(x1 - x0, y1 - y0) + 2 * pad
-    sx0, sy0 = int(round(x0 - pad)), int(round(y0 - pad))
-    size = int(np.ceil(span)) + 1
-    crop = np.zeros((size, size), dtype=np.uint8)
-    src = mask[max(sy0, 0) :, max(sx0, 0) :].astype(np.uint8)
-    dy, dx = max(-sy0, 0), max(-sx0, 0)
-    hh = min(src.shape[0], size - dy)
-    ww = min(src.shape[1], size - dx)
-    crop[dy : dy + hh, dx : dx + ww] = src[:hh, :ww]
-    gscale = grid / float(size)
-    target = cv2.resize(crop, (grid, grid), interpolation=cv2.INTER_AREA) > 0
+    vt = _ViewTarget(view.mask, grid)
+    sx0, sy0, size, crop = vt.sx0, vt.sy0, vt.size, vt.crop
+    gscale, target = vt.gscale, vt.target
+    x0, x1, y0, y1 = vt.bbox
     bw, bh = float(x1 - x0 + 1), float(y1 - y0 + 1)
     bcx, bcy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
 
@@ -557,12 +789,17 @@ def _fit_pose(
         }
     )
 
-    def looks_up(rot: np.ndarray) -> bool:
-        # Product shots look at the object from the side or above.
-        return float(rot[2, 1]) > 0.1
+    looks_up = _looks_up
+    fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy
+
+    if init is not None:
+        rot0, t0 = init[0], np.asarray(init[1], dtype=np.float64).reshape(3)
+        tz = float(t0[2])
+    else:
+        rot0, t0, tz = None, None, 0.0
 
     best_score, best_params = -1.0, (0.0, 0.0, 0.0)
-    for az in range(0, 360, 10):
+    for az in range(0, 360, 10) if init is None else ():
         for el in els:
             rot = _base_rotation(az, el)
             if looks_up(rot):
@@ -571,7 +808,7 @@ def _fit_pose(
             if score > best_score:
                 best_score, best_params = score, (float(az), el, 0.0)
     az0, el0, _ = best_params
-    for az in np.arange(az0 - 8.0, az0 + 9.0, 4.0):
+    for az in np.arange(az0 - 8.0, az0 + 9.0, 4.0) if init is None else ():
         for el in np.arange(el0 - 6.0, el0 + 7.0, 3.0):
             el_c = float(np.clip(el, -90.0, 90.0))
             for roll in (-4.0, 0.0, 4.0):
@@ -582,11 +819,11 @@ def _fit_pose(
                 if score > best_score:
                     best_score, best_params = score, (float(az), el_c, roll)
 
-    rot0 = _base_rotation(*best_params)
-    _, s, a, b = ortho_fit(rot0, points)
-    fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy
-    tz = fx / s
-    t0 = np.array([(a - cx) / s, (b - cy) / s, tz])
+    if init is None:
+        rot0 = _base_rotation(*best_params)
+        _, s, a, b = ortho_fit(rot0, points)
+        tz = fx / s
+        t0 = np.array([(a - cx) / s, (b - cy) / s, tz])
 
     def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         rot = Rotation.from_rotvec(params[:3]).as_matrix() @ rot0
@@ -796,27 +1033,9 @@ def project_vertex_colors(
     return np.clip(colors, 0.0, 1.0)
 
 
-def reconstruct_revolution(
-    images: Sequence[Image.Image],
-    masks: Sequence[np.ndarray],
-    intrinsics: CameraIntrinsics,
-    *,
-    analyses: Sequence[ViewAnalysis] | None = None,
-    resolution: int = 132,
-    hollow: bool | None = None,
-    wall_thickness: float = 0.045,
-    floor_thickness: float = 0.07,
-    colorize: bool = True,
-) -> RevolutionModel:
-    """Build a watertight surface-of-revolution model (plus handle) from views."""
-    if analyses is None:
-        analyses = [analyze_view(m) for m in masks]
-    side = [a for a in analyses if a.profile is not None]
-    if not side:
-        raise ReconstructionError(
-            "Revolution reconstruction needs at least one near side-on view."
-        )
-
+def _combine_profiles(
+    side: Sequence[ViewAnalysis],
+) -> tuple[np.ndarray, float]:
     # The closer to side-on, the less the foot/rim ellipses distort the profile.
     min_el = min(a.elevation_deg for a in side)
     side = [a for a in side if a.elevation_deg <= min_el + 8.0]
@@ -829,6 +1048,66 @@ def reconstruct_revolution(
         stack = stack[keep]
     profile = gaussian_filter1d(stack.mean(axis=0), sigma=4.0, mode="nearest")
     height = float(np.median([a.height_ratio for a in side]))
+    return profile, height
+
+
+def _build_parts(
+    analyses: Sequence[ViewAnalysis],
+    side: Sequence[ViewAnalysis],
+    height: float,
+    wall: float,
+) -> list[_HandleField]:
+    parts: list[_HandleField] = []
+    part_views = [a for a in side if a.appendages]
+    if not part_views:
+        return parts
+    pv = max(
+        part_views,
+        key=lambda a: sum(app.area for app in a.appendages) / a.scale_px**2,
+    )
+    largest = pv.appendages[0].area
+    for app in pv.appendages:
+        if app.area < 0.2 * largest:
+            continue
+        try:
+            parts.append(_HandleField(pv, app, height, wall, None))
+        except ReconstructionError:
+            continue
+    return parts
+
+
+_DEPTH_SCALES = (0.6, 0.8, 1.0, 1.3, 1.7, 2.2)
+
+
+def reconstruct_revolution(
+    images: Sequence[Image.Image],
+    masks: Sequence[np.ndarray],
+    intrinsics: CameraIntrinsics,
+    *,
+    analyses: Sequence[ViewAnalysis] | None = None,
+    resolution: int = 132,
+    hollow: bool | None = None,
+    wall_thickness: float = 0.045,
+    floor_thickness: float = 0.07,
+    colorize: bool = True,
+) -> RevolutionModel:
+    """Build a watertight surface-of-revolution model (plus parts) from views.
+
+    1. Measure the profile from near side-on views and build a coarse model.
+    2. Fit every camera against it and read each view's true elevation from
+       its fitted camera; re-measure the profiles with those and rebuild.
+    3. Pick each handle/spout's out-of-plane thickness by silhouette overlap
+       over all views.
+    4. Build the final mesh, refine the cameras and project colours.
+    """
+    if analyses is None:
+        analyses = [analyze_view(m) for m in masks]
+    analyses = list(analyses)
+    side = [a for a in analyses if a.profile is not None]
+    if not side:
+        raise ReconstructionError(
+            "Revolution reconstruction needs at least one near side-on view."
+        )
 
     grays = [
         cv2.cvtColor(np.asarray(img.convert("RGB")), cv2.COLOR_RGB2GRAY)
@@ -837,38 +1116,80 @@ def reconstruct_revolution(
     if hollow is None:
         hollow = _detect_open_top(analyses, grays)
 
-    wall = wall_thickness
-    body = _BodyField(
-        profile,
-        height,
-        hollow=hollow,
-        wall=wall,
-        floor=floor_thickness * height,
-    )
+    coarse_res = max(48, resolution // 2)
 
-    handle_field = None
-    handle_views = [a for a in side if a.handle_side != 0]
-    if handle_views:
-        hv = max(handle_views, key=lambda a: a.handle_area / a.diameter_px**2)
-        top = [a for a in analyses if a.elevation_deg >= TOP_VIEW_MIN_ELEVATION]
-        depth = _top_view_handle_depth(top[0]) if top else None
-        try:
-            handle_field = _HandleField(hv, height, wall, depth)
-        except ReconstructionError:
-            handle_field = None
+    def assemble(views: Sequence[ViewAnalysis]):
+        side_views = [a for a in views if a.profile is not None]
+        profile, height = _combine_profiles(side_views)
+        # Wall thickness scales with the widest part, not the (maybe narrow) lip.
+        wall = wall_thickness * max(1.0, 2.0 * float(profile.max()))
+        body = _BodyField(
+            profile, height, hollow=hollow, wall=wall, floor=floor_thickness * height
+        )
+        parts = _build_parts(views, side_views, height, wall)
+        return profile, height, wall, body, parts
 
+    def fit_all(points, inits=None):
+        poses = []
+        for idx, a in enumerate(analyses):
+            init = None if inits is None else inits[idx]
+            rot, trans, _ = _fit_pose(points, a, intrinsics, init=init)
+            poses.append((rot, trans))
+        return poses
+
+    # 1-2. Coarse model, cameras, elevation feedback.
+    profile, height, wall, body, parts = assemble(analyses)
     r_out = float(profile.max())
-    verts, faces = _build_mesh(body, handle_field, height, r_out, resolution, wall)
-    verts = taubin_smooth(verts, faces)
+    grid = _FieldGrid(body, parts, height, r_out, coarse_res, wall)
+    coarse_v, _ = grid.mesh(parts)
+    poses = fit_all(coarse_v)
 
+    fitted = [
+        with_elevation(a, max(camera_elevation(rot), 0.0))
+        for a, (rot, _) in zip(analyses, poses, strict=True)
+    ]
+    if any(a.profile is not None for a in fitted):
+        moved = max(
+            abs(f.elevation_deg - a.elevation_deg)
+            for f, a in zip(fitted, analyses, strict=True)
+            if a.profile is not None or f.profile is not None
+        )
+        if moved > 2.0:
+            analyses_fb = fitted
+            profile, height, wall, body, parts = assemble(analyses_fb)
+            r_out = float(profile.max())
+            grid = _FieldGrid(body, parts, height, r_out, coarse_res, wall)
+            coarse_v, _ = grid.mesh(parts)
+            poses = fit_all(coarse_v, poses)
+
+    # 3. Out-of-plane thickness of each part, by overlap over all views.
+    if parts:
+        targets = [_ViewTarget(a.mask) for a in analyses]
+
+        def overlap(points):
+            return float(
+                np.mean(
+                    [
+                        t.iou(points, rot, trans, intrinsics)
+                        for t, (rot, trans) in zip(targets, poses, strict=True)
+                    ]
+                )
+            )
+
+        for part in parts:
+            scores = []
+            for k in _DEPTH_SCALES:
+                part.k = k
+                scores.append(overlap(grid.mesh(parts)[0]))
+            part.k = _DEPTH_SCALES[int(np.argmax(scores))]
+
+    # 4. Final mesh, refined cameras, colours.
+    verts, faces = _build_mesh(body, parts, height, r_out, resolution, wall)
+    verts = taubin_smooth(verts, faces)
     stride = max(1, len(verts) // 30000)
-    samples = verts[::stride]
-    rotations = []
-    translations = []
-    for a in analyses:
-        rot, trans, _ = _fit_pose(samples, a, intrinsics)
-        rotations.append(rot)
-        translations.append(trans)
+    poses = fit_all(verts[::stride], poses)
+    rotations = [rot for rot, _ in poses]
+    translations = [trans for _, trans in poses]
 
     colors = None
     if colorize:
@@ -892,5 +1213,5 @@ def reconstruct_revolution(
         profile=profile,
         height_ratio=height,
         hollow=bool(hollow),
-        has_handle=handle_field is not None,
+        appendage_count=len(parts),
     )

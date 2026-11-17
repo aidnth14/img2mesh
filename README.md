@@ -56,10 +56,27 @@ img2mesh ./photos ./model.glb --mode silhouette --shape-prior revolution
 img2mesh ./photos ./model.glb --mode silhouette --shape-prior none     # plain visual hull
 ```
 
-The revolution prior needs at least one near side-on view (elevation below
-about 25°). A top-down view, when present, sets the handle's out-of-plane
-thickness. The prior assumes the photos look at the object from the side or
-from above. GLB and OBJ exports carry per-vertex colour (STL has none).
+The revolution prior handles rims, necks, lids, knobs and caps, any number of
+handles and spouts on either side, and open (hollow) or closed tops. It needs
+at least one near side-on view (elevation below about 25°) and assumes the
+photos look at the object from the side or from above. GLB and OBJ exports
+carry per-vertex colour (STL has none).
+
+### Accuracy benchmark
+
+`python -m img2mesh.benchmark` renders ten synthetic objects with known
+shapes (cup, bowl, vase, capped bottle, lidded jar, teapot, amphora, box,
+toy duck, shoe) as product shots, reconstructs each from six views, aligns
+the result to the ground truth and reports F-score / precision / recall at
+2% of the object size, Chamfer distance, genus, and silhouette IoU from a
+seventh held-out view. Self-reported IoU on the input views is shown only for
+contrast: carving-style methods score well on it even when the shape is wrong.
+
+```bash
+python -m img2mesh.benchmark                                  # everything
+python -m img2mesh.benchmark --objects cup,box --methods auto,none
+python -m img2mesh.benchmark --json results.json --save-meshes meshes/
+```
 
 ### CLI Options
 
@@ -103,6 +120,7 @@ src/img2mesh/
   mesh.py       Point-cloud filtering and alpha-shape meshing
   pipeline.py   Bundle adjustment and incremental SfM pipeline
   revolve.py    Surface-of-revolution shape prior, pose fitting, vertex colours
+  benchmark/    Synthetic objects, renderer, shape metrics, benchmark runner
   silhouette.py Foreground masks, visual hull, marching tetrahedra
 tests/
   test_cli.py
@@ -110,6 +128,7 @@ tests/
   test_geometry.py
   test_image.py
   test_io.py
+  test_benchmark.py
   test_pipeline.py
   test_revolve.py
   test_silhouette.py
