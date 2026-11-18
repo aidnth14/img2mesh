@@ -35,6 +35,15 @@ dev = [
     "pytest>=8.0",
     "ruff>=0.6",
 ]
+# Building benchmark datasets from glTF/GLB scans (img2mesh.benchmark.meshdata).
+benchmark = [
+    "trimesh>=4.0",
+]
+# Learned background removal (masker="rembg").
+masks = [
+    "rembg>=2.0",
+    "onnxruntime>=1.16",
+]
 
 [project.scripts]
 img2mesh = "img2mesh.cli:main"

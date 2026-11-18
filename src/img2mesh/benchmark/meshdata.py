@@ -29,6 +29,25 @@ class TexturedMesh:
     face_uvs: np.ndarray  # (F, 3) uv indices
     texture: np.ndarray  # (H, W, 3) float in [0, 1]
     vertex_normals: np.ndarray
+    # Multi-material models (glTF scenes): per-face texture index into
+    # ``textures`` (-1 = untextured, coloured by ``face_colors``).
+    textures: tuple[np.ndarray, ...] = ()
+    face_tex: np.ndarray | None = None
+    face_colors: np.ndarray | None = None
+
+    def albedo(self, face_idx: np.ndarray, uv: np.ndarray) -> np.ndarray:
+        """Surface colour for faces ``face_idx`` at texture coordinates ``uv``."""
+        if self.face_tex is None:
+            return sample_texture(self.texture, uv)
+        out = np.empty((len(face_idx), 3))
+        tex_id = self.face_tex[face_idx]
+        for t in np.unique(tex_id):
+            sel = tex_id == t
+            if t < 0:
+                out[sel] = self.face_colors[face_idx[sel]]
+            else:
+                out[sel] = sample_texture(self.textures[t], uv[sel])
+        return out
 
     @property
     def bounds(self) -> tuple[np.ndarray, np.ndarray]:
@@ -46,6 +65,15 @@ class TexturedMesh:
 
     def vertex_colors(self) -> np.ndarray:
         """Per-vertex colour from the texture (first UV seen per vertex)."""
+        if self.face_tex is not None:
+            corner_faces = np.repeat(np.arange(len(self.faces)), 3)
+            corner_uv = self.uvs[self.face_uvs.ravel()]
+            corner_col = self.albedo(corner_faces, corner_uv)
+            total = np.zeros((len(self.vertices), 3))
+            count = np.zeros(len(self.vertices))
+            np.add.at(total, self.faces.ravel(), corner_col)
+            np.add.at(count, self.faces.ravel(), 1.0)
+            return total / np.maximum(count, 1.0)[:, None]
         colors = np.zeros((len(self.vertices), 3))
         uv_for_vertex = np.full(len(self.vertices), -1, dtype=np.int64)
         uv_for_vertex[self.faces.ravel()[::-1]] = self.face_uvs.ravel()[::-1]
@@ -74,6 +102,107 @@ def _vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
     for corner in range(3):
         np.add.at(normals, faces[:, corner], fn)
     return normals / np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+
+
+def _normalise(v: np.ndarray) -> np.ndarray:
+    lo, hi = v.min(axis=0), v.max(axis=0)
+    scale = 1.0 / max(float(np.max(hi - lo)), 1e-12)
+    return (v - np.array([0.5 * (lo[0] + hi[0]), lo[1], 0.5 * (lo[2] + hi[2])])) * scale
+
+
+def _rgb_factor(material) -> np.ndarray:
+    factor = getattr(material, "baseColorFactor", None)
+    if factor is None:
+        factor = getattr(material, "main_color", None)
+    if factor is None:
+        return np.ones(3)
+    factor = np.asarray(factor, dtype=np.float64)[:3]
+    return factor / 255.0 if factor.max() > 1.0 else factor
+
+
+def load_glb_textured(path: str | Path, *, max_texture: int = 2048) -> TexturedMesh:
+    """Load a glTF/GLB scene (node transforms, several materials) as one mesh.
+
+    glTF is Y-up, so no axis swap; the result is normalised like
+    :func:`load_textured_obj`. Needs ``trimesh`` (dataset building only).
+    """
+    import trimesh
+
+    scene = trimesh.load(str(path), force="scene", process=False)
+    meshes = scene.dump(concatenate=False) if hasattr(scene, "dump") else [scene]
+    verts, faces, uvs, face_uvs, face_tex, face_cols = (
+        [],
+        [],
+        [np.zeros((1, 2))],
+        [],
+        [],
+        [],
+    )
+    textures: list[np.ndarray] = []
+    tex_index: dict[int, int] = {}
+    v_off, uv_off = 0, 1
+    for mesh in meshes:
+        if not isinstance(mesh, trimesh.Trimesh) or len(mesh.faces) == 0:
+            continue
+        v = np.asarray(mesh.vertices, dtype=np.float64)
+        f = np.asarray(mesh.faces, dtype=np.int64)
+        visual = mesh.visual
+        tex_id, colour = -1, np.full(3, 0.6)
+        kind = getattr(visual, "kind", None)
+        uv = getattr(visual, "uv", None) if kind == "texture" else None
+        if kind == "texture":
+            material = visual.material
+            image = getattr(material, "baseColorTexture", None)
+            if image is None:
+                image = getattr(material, "image", None)
+            factor = _rgb_factor(material)
+            if image is not None and uv is not None and len(uv) == len(v):
+                key = id(image)
+                if key not in tex_index:
+                    img = image.convert("RGB")
+                    if max(img.size) > max_texture:
+                        img.thumbnail(
+                            (max_texture, max_texture), Image.Resampling.LANCZOS
+                        )
+                    arr = np.asarray(img, dtype=np.float64) / 255.0
+                    tex_index[key] = len(textures)
+                    textures.append(np.clip(arr * factor[None, None, :], 0.0, 1.0))
+                tex_id = tex_index[key]
+            else:
+                colour = factor
+                uv = None
+        elif kind == "vertex":
+            vc = np.asarray(visual.vertex_colors, dtype=np.float64)[:, :3] / 255.0
+            colour = None
+            per_face = vc[f].mean(axis=1)
+        else:
+            colour = _rgb_factor(getattr(visual, "material", None))
+        verts.append(v)
+        faces.append(f + v_off)
+        if tex_id >= 0:
+            uvs.append(np.asarray(uv, dtype=np.float64))
+            face_uvs.append(f + uv_off)
+            uv_off += len(uv)
+        else:
+            face_uvs.append(np.zeros_like(f))
+        face_tex.append(np.full(len(f), tex_id, dtype=np.int64))
+        face_cols.append(per_face if colour is None else np.tile(colour, (len(f), 1)))
+        v_off += len(v)
+    if not verts:
+        raise ValueError(f"No triangle meshes in {path}")
+    v = _normalise(np.vstack(verts))
+    f = np.vstack(faces)
+    return TexturedMesh(
+        vertices=v,
+        faces=f,
+        uvs=np.vstack(uvs),
+        face_uvs=np.vstack(face_uvs),
+        texture=textures[0] if textures else np.full((2, 2, 3), 0.6),
+        vertex_normals=_vertex_normals(v, f),
+        textures=tuple(textures),
+        face_tex=np.concatenate(face_tex),
+        face_colors=np.vstack(face_cols),
+    )
 
 
 def load_textured_obj(
@@ -220,7 +349,7 @@ def render_mesh_view(
     fidx = best_face[pix]
     bary = best_bary[pix]
     uv = np.einsum("ij,ijk->ik", bary, mesh.uvs[mesh.face_uvs[fidx]])
-    albedo = sample_texture(mesh.texture, uv)
+    albedo = mesh.albedo(fidx, uv)
     normal = np.einsum("ij,ijk->ik", bary, mesh.vertex_normals[faces[fidx]])
     normal /= np.maximum(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12)
     points = np.einsum("ij,ijk->ik", bary, mesh.vertices[faces[fidx]])

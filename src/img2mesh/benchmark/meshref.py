@@ -222,6 +222,107 @@ def add_artifact(name: str, out_dir: Path, number: int, size: int = 512) -> Path
     return folder
 
 
+def _slug(text: str) -> str:
+    import re
+
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")[:60]
+
+
+def build_from_selection(
+    selection_json: Path,
+    glb_dir: Path,
+    out_dir: Path,
+    *,
+    size: int = 512,
+    workers: int = 4,
+) -> None:
+    """Build meshref from a category list matched to GLB models.
+
+    ``selection_json`` holds one entry per category: ``id``, ``item``,
+    ``section``, ``status`` and, for matched ones, ``uid``, ``name``,
+    ``license``, ``author``, ``url``, ``score``. Every category gets a folder;
+    unmatched ones get a NOT_AVAILABLE.txt saying why.
+    """
+    entries = json.loads(selection_json.read_text())
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jobs = []
+    for e in entries:
+        folder = out_dir / f"{e['id']:03d}_{_slug(e['item'])}"
+        folder.mkdir(exist_ok=True)
+        glb = glb_dir / f"{e.get('uid', '')}.glb"
+        if e["status"] != "matched" or not glb.is_file():
+            reason = (
+                e["status"] if e["status"] != "matched" else "model failed to download"
+            )
+            (folder / "NOT_AVAILABLE.txt").write_text(
+                f"{e['item']} ({e['section']})\n\nNo images: {reason}.\n"
+                + (f"Closest model found: {e['closest']}\n" if e.get("closest") else "")
+            )
+            continue
+        if (folder / "meta.json").is_file():  # already built: keep (incremental)
+            continue
+        jobs.append((e, folder, glb))
+    built = [
+        (p.name, json.loads((p / "meta.json").read_text())["category"])
+        for p in sorted(out_dir.iterdir())
+        if (p / "meta.json").is_file()
+    ]
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {
+            pool.submit(_build_glb_one, e, folder, glb, size): (e, folder)
+            for e, folder, glb in jobs
+        }
+        for future in as_completed(futures):
+            e, folder = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                (folder / "NOT_AVAILABLE.txt").write_text(
+                    f"{e['item']} ({e['section']})\n\nNo images: the model could "
+                    f"not be rendered ({type(exc).__name__}: {exc}).\n"
+                )
+                print(f"skip {folder.name}: {exc}", file=sys.stderr, flush=True)
+                continue
+            built.append((folder.name, e["section"]))
+            print(f"[{len(built):3d}] {folder.name}", flush=True)
+    _write_split(out_dir, built)
+
+
+def _build_glb_one(entry: dict, folder: Path, glb: Path, size: int) -> None:
+    from .meshdata import load_glb_textured, render_mesh_view
+
+    mesh = load_glb_textured(glb)
+    (folder / "images").mkdir(exist_ok=True)
+    (folder / "eval").mkdir(exist_ok=True)
+    records = []
+    for idx, (az, el) in enumerate(PHOTO_VIEWS, start=1):
+        view = render_mesh_view(mesh, az, el, size=size)
+        view.image.save(folder / "images" / f"view_{idx}_az{az:+.0f}_el{el:.0f}.png")
+        records.append(_view_record(view))
+    held = render_mesh_view(mesh, *HELDOUT_VIEW, size=size)
+    held.image.save(folder / "eval" / "heldout.png")
+    Image.fromarray(held.mask.astype(np.uint8) * 255).save(
+        folder / "eval" / "heldout_mask.png"
+    )
+    export_glb(_clean_true_mesh(mesh), folder / "true_model.glb", overwrite=True)
+    meta = {
+        "name": entry["item"],
+        "category": entry["section"],
+        "item_id": entry["id"],
+        "model_name": entry.get("name"),
+        "description": f"{entry['item']}: represented by '{entry.get('name')}'",
+        "match_confidence": "good" if entry.get("score", 0) >= 12 else "approximate",
+        "match_score": entry.get("score"),
+        "textured": True,
+        "source": entry.get("url"),
+        "author": entry.get("author"),
+        "license": f"CC {entry.get('license', '').upper()} (Sketchfab via Objaverse)",
+        "views": records,
+        "heldout_view": _view_record(held),
+    }
+    (folder / "meta.json").write_text(json.dumps(meta, indent=1))
+
+
 # -------------------------------------------------------------- evaluate ---
 
 
@@ -473,6 +574,8 @@ def reconstruct(out_dir: Path) -> None:
     from ..silhouette import reconstruct_visual_hull
 
     for folder in sorted(p for p in out_dir.iterdir() if (p / "meta.json").is_file()):
+        if (folder / "img2mesh_model.glb").is_file():
+            continue  # incremental
         images = [
             Image.open(p).convert("RGB")
             for p in sorted((folder / "images").glob("view_*.png"))
@@ -502,6 +605,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     c.add_argument("--masker", choices=("color", "rembg"), default="color")
     r = sub.add_parser("reconstruct")
     r.add_argument("out_dir", type=Path)
+    bs = sub.add_parser("build-selection")
+    bs.add_argument("selection_json", type=Path)
+    bs.add_argument("glb_dir", type=Path)
+    bs.add_argument("out_dir", type=Path)
+    bs.add_argument("--workers", type=int, default=4)
     a = sub.add_parser("add-artifact")
     a.add_argument("name")
     a.add_argument("out_dir", type=Path)
@@ -511,6 +619,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         build(args.raw_dir, args.chosen_json, args.out_dir)
     elif args.command == "evaluate":
         evaluate(args.out_dir, args.workers, args.masker)
+    elif args.command == "build-selection":
+        build_from_selection(
+            args.selection_json, args.glb_dir, args.out_dir, workers=args.workers
+        )
     elif args.command == "add-artifact":
         print(add_artifact(args.name, args.out_dir, args.number))
     elif args.command == "calibrate":
