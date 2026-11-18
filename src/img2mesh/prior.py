@@ -50,6 +50,19 @@ _UP_CANDIDATES = {
 }
 
 
+def rotation_to_up(direction: Sequence[float]) -> np.ndarray:
+    """Rotation taking ``direction`` to world +Y."""
+    u = np.asarray(direction, dtype=np.float64)
+    u = u / np.linalg.norm(u)
+    y = np.array([0.0, 1.0, 0.0])
+    axis = np.cross(u, y)
+    sin = float(np.linalg.norm(axis))
+    cos = float(u @ y)
+    if sin < 1e-9:
+        return np.eye(3) if cos > 0 else _UP_CANDIDATES["-y"].copy()
+    return Rotation.from_rotvec(axis / sin * np.arctan2(sin, cos)).as_matrix()
+
+
 def normalize_prior(vertices: np.ndarray) -> np.ndarray:
     """Centre on the bounding box and scale the longest side to 1.6."""
     lo, hi = vertices.min(axis=0), vertices.max(axis=0)
@@ -136,6 +149,23 @@ def _rank_up_axes(
     return [name for _, name in sorted(scores, reverse=True)]
 
 
+def _pose_from_rotation(
+    points: np.ndarray,
+    view: ViewAnalysis,
+    rotation: np.ndarray,
+    intrinsics: CameraIntrinsics,
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Refine a camera whose orientation is (nearly) known."""
+    p = points @ rotation.T
+    ys, xs = np.nonzero(view.mask)
+    bw, bh = float(np.ptp(xs) + 1), float(np.ptp(ys) + 1)
+    s = 0.5 * (bw / max(np.ptp(p[:, 0]), 1e-9) + bh / max(np.ptp(p[:, 1]), 1e-9))
+    a = 0.5 * (xs.min() + xs.max()) - s * 0.5 * (p[:, 0].max() + p[:, 0].min())
+    b = 0.5 * (ys.min() + ys.max()) - s * 0.5 * (p[:, 1].max() + p[:, 1].min())
+    t0 = np.array([(a - intrinsics.cx) / s, (b - intrinsics.cy) / s, intrinsics.fx / s])
+    return _fit_pose(points, view, intrinsics, init=(rotation, t0))
+
+
 def _consistent_poses(
     oriented: np.ndarray,
     faces: np.ndarray,
@@ -144,6 +174,7 @@ def _consistent_poses(
     *,
     candidates: int = 3,
     grid_res: int = 44,
+    fixed: dict[int, np.ndarray] | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], float]:
     """Per-view pose candidates, then the mutually consistent combination.
 
@@ -156,11 +187,14 @@ def _consistent_poses(
 
     # Candidates only need to be told apart; the final fit refines the winner.
     pts = oriented[:: max(1, len(oriented) // 15000)]
+    fixed = fixed or {}
     options = [
-        _fit_pose_candidates(
+        [_pose_from_rotation(pts, v, fixed[i], intrinsics)]
+        if i in fixed
+        else _fit_pose_candidates(
             pts, v, intrinsics, elevations=_ALL_ELEVATIONS, count=candidates
         )
-        for v in views
+        for i, v in enumerate(views)
     ]
     bound = 1.1
     grid = _make_voxel_grid(grid_res, bound)
@@ -204,6 +238,9 @@ def _consistent_poses(
     return [options[i][c][:2] for i, c in enumerate(choice)], best
 
 
+_DEPTH_SCALES = (0.6, 0.8, 1.0, 1.25, 1.6, 2.0)
+
+
 def reconstruct_with_prior(
     images: Sequence[Image.Image],
     masks: Sequence[np.ndarray],
@@ -213,14 +250,24 @@ def reconstruct_with_prior(
     resolution: int = 110,
     up_axis: str | None = None,
     dilation: float = 0.02,
+    up_candidates: Sequence[Sequence[float]] | None = None,
+    depth_axis: Sequence[float] | None = None,
+    input_view: int | None = None,
+    input_camera: np.ndarray | None = None,
 ) -> tuple[MeshResult, list[tuple[np.ndarray, np.ndarray]], str]:
     """Fit cameras to an external prior mesh and refine it against the photos.
 
     ``up_axis`` ("+y", "-z", ...) names the prior's up direction if known;
     otherwise it is chosen by silhouette fit. ``dilation`` (in prior units,
     longest side 1.6) is how far the result may extend beyond the prior where
-    every silhouette still allows it. Returns the mesh, the per-view cameras
-    and the up axis used.
+    every silhouette still allows it. ``up_candidates`` (directions in the
+    prior's frame) replaces the axis search when a generator's frame is known.
+    ``depth_axis`` (prior frame) is the generator's input viewing axis; the
+    prior is rescaled along it to fit the photos, since single-image models
+    guess thickness worst. ``input_view`` / ``input_camera`` give the photo the
+    prior was generated from and the generator's camera rotation for it (in
+    the prior's frame): that camera is then known rather than searched for.
+    Returns the mesh, the per-view cameras and the up direction used.
     """
     from .revolve import analyze_view
     from .silhouette import _carve_voxels, _make_voxel_grid, marching_tetrahedra
@@ -231,21 +278,57 @@ def reconstruct_with_prior(
     base = normalize_prior(np.asarray(prior.vertices, dtype=np.float64))
     faces = np.asarray(prior.faces, dtype=np.int64)
 
-    if up_axis is None:
-        ranked = _rank_up_axes(base, views, intrinsics)[:2]
-    elif up_axis in _UP_CANDIDATES:
-        ranked = [up_axis]
+    if up_axis is not None:
+        if up_axis not in _UP_CANDIDATES:
+            raise ReconstructionError(
+                f"up_axis must be one of {', '.join(_UP_CANDIDATES)}."
+            )
+        options = [(up_axis, _UP_CANDIDATES[up_axis])]
+    elif up_candidates is not None:
+        options = [
+            (
+                np.array2string(np.round(np.asarray(u, float), 3), separator=","),
+                rotation_to_up(u),
+            )
+            for u in up_candidates
+        ]
     else:
-        raise ReconstructionError(
-            f"up_axis must be one of {', '.join(_UP_CANDIDATES)}."
-        )
+        options = [
+            (name, _UP_CANDIDATES[name])
+            for name in _rank_up_axes(base, views, intrinsics)[:2]
+        ]
+
+    def fixed_for(rot: np.ndarray) -> dict[int, np.ndarray] | None:
+        if input_view is None or input_camera is None:
+            return None
+        # base = rot.T @ oriented, so the camera seen from the oriented frame:
+        return {input_view: np.asarray(input_camera, dtype=np.float64) @ rot.T}
+
     best = None
-    for name in ranked:
-        candidate = base @ _UP_CANDIDATES[name].T
-        poses, score = _consistent_poses(candidate, faces, views, intrinsics)
+    for name, rot in options:
+        candidate = base @ rot.T
+        poses, score = _consistent_poses(
+            candidate, faces, views, intrinsics, fixed=fixed_for(rot)
+        )
         if best is None or score > best[0]:
-            best = (score, name, candidate, poses)
-    _, up_axis, oriented, poses = best
+            best = (score, name, candidate, poses, rot)
+    score, up_axis, oriented, poses, up_rot = best
+
+    if depth_axis is not None:
+        axis = np.asarray(depth_axis, dtype=np.float64)
+        axis = axis / np.linalg.norm(axis)
+        center = base.mean(axis=0)
+        for scale in _DEPTH_SCALES:
+            if scale == 1.0:
+                continue
+            offset = (base - center) @ axis
+            stretched = base + (scale - 1.0) * offset[:, None] * axis[None, :]
+            candidate = stretched @ up_rot.T
+            trial_poses, trial = _consistent_poses(
+                candidate, faces, views, intrinsics, fixed=fixed_for(up_rot)
+            )
+            if trial > score + 1e-3:
+                score, oriented, poses = trial, candidate, trial_poses
 
     bound = 1.1
     grid = _make_voxel_grid(resolution, bound)

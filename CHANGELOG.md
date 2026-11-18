@@ -33,6 +33,12 @@
   Optional `learned_backend=` / `--learned-prior triposr` generates the prior
   (`img2mesh.learned`, lazy optional dependencies, pluggable registry).
   Benchmark with a simulated prior: non-round objects F@2% 0.36 -> 0.84.
+- TripoSR backend verified end to end (CPU; ~20 s per prior): corrected
+  setup instructions, generator meshes are cleaned of degenerate triangles,
+  the most side-on photo is used as input, and backends declare their frame
+  (up-direction candidates, depth axis, input camera) so the input photo's
+  camera is known and the prior's thickness is fitted. Benchmark `learned`
+  method: non-round F@2% 0.45 (hull 0.36).
 - `img2mesh.io.load_mesh` reads .obj, .stl (binary/ASCII, welded) and .glb.
 - Marching tetrahedra no longer leaves pinholes when grid values sit within
   ~1e-7 of the iso-level.

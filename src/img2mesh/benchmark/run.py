@@ -21,7 +21,8 @@ cameras, refined by ICP) and scored with:
 Methods: ``auto`` / ``revolution`` / ``none`` are the shape priors; ``angles``
 is visual-hull carving given the true view angles; ``prior`` refines a
 simulated learned prior (see :func:`simulated_learned_prior`) whose up axis is
-found automatically, ``prior_up`` the same prior with its up axis given.
+found automatically, ``prior_up`` the same prior with its up axis given, and
+``learned`` a real TripoSR prior (optional dependencies required).
 """
 
 from __future__ import annotations
@@ -170,6 +171,10 @@ def evaluate(
         if method == "prior_up":
             # Generators output a fixed, documented orientation (Z up here).
             kwargs["prior_up_axis"] = "+z"
+    elif method == "learned":
+        # A real learned generator (needs its optional dependencies).
+        kwargs["shape_prior"] = "none"
+        kwargs["learned_backend"] = "triposr"
     elif method == "angles":
         # Visual hull given the true view angles (as from a turntable rig).
         kwargs["shape_prior"] = "none"

@@ -85,10 +85,21 @@ img2mesh ./photos ./model.glb --mode silhouette --learned-prior triposr   # opti
 
 The prior can be in any frame and scale (`--prior-up-axis` helps when its up
 direction is known; otherwise it is detected, less reliably for symmetric
-shapes). The built-in `triposr` backend needs `pip install torch
-git+https://github.com/VAST-AI-Research/TripoSR` and downloads its weights on
-first use; other generators can be registered with
-`img2mesh.learned.register_backend`.
+shapes). Other generators can be registered with
+`img2mesh.learned.register_backend`. The built-in `triposr` backend needs a
+separate environment (Python 3.12 recommended):
+
+```bash
+git clone --depth 1 https://github.com/VAST-AI-Research/TripoSR ~/TripoSR
+uv venv --python 3.12 .venv-learned && source .venv-learned/bin/activate
+uv pip install torch omegaconf einops "transformers==4.35.0" trimesh \
+    huggingface-hub imageio rembg onnxruntime scikit-build-core pybind11 cmake ninja
+uv pip install --no-build-isolation git+https://github.com/tatsy/torchmcubes.git
+uv pip install -e .
+export PYTHONPATH=~/TripoSR   # TripoSR is not a pip package
+```
+
+Its weights (~1.7 GB) download from Hugging Face on first use.
 
 ### Accuracy benchmark
 
@@ -118,7 +129,12 @@ Current results (F-score at 2% of object size; Chamfer as % of size):
 
 `prior_up` uses a degraded copy of the ground truth as a stand-in for a
 generator's output; it measures how well a decent prior is exploited, not
-the quality of any particular learned model.
+the quality of any particular learned model. With the real TripoSR backend
+(`--methods learned`, optional environment) the non-round objects reach
+F 0.45 (shoe 0.67, duck 0.41, box 0.26; plain hull 0.36): TripoSR's single-view
+guesses on these renders are far weaker than the stand-in, mostly in
+thickness, which silhouettes cannot correct. On the real cup photos the
+TripoSR path matches the revolution prior (silhouette IoU 0.957).
 
 ### CLI Options
 

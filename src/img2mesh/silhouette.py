@@ -859,13 +859,29 @@ def reconstruct_visual_hull(
             "Foreground segmentation produced an empty mask for one or more views."
         )
 
+    prior_up_candidates = None
+    prior_depth_axis = None
+    prior_input = (None, None)
     if learned_backend is not None and prior_mesh is None:
-        from .learned import generate_prior_mesh
+        from .learned import (
+            backend_depth_axis,
+            backend_input_camera,
+            backend_up_candidates,
+            generate_prior_mesh,
+        )
+        from .revolve import analyze_view
 
-        best = int(np.argmax([np.count_nonzero(m) for m in bool_masks]))
+        # Generators work in their input camera's frame, so feed the most
+        # side-on photo: the object is then nearly upright in the output.
+        elevations = [analyze_view(m).elevation_deg for m in bool_masks]
+        best = int(np.argmin(elevations))
         prior_mesh = generate_prior_mesh(
             view_images[best], bool_masks[best], backend=learned_backend
         )
+        if prior_up_axis is None:
+            prior_up_candidates = backend_up_candidates(learned_backend)
+        prior_depth_axis = backend_depth_axis(learned_backend)
+        prior_input = (best, backend_input_camera(learned_backend))
 
     if prior_mesh is not None:
         from .prior import reconstruct_with_prior
@@ -877,6 +893,10 @@ def reconstruct_visual_hull(
             intrinsics,
             resolution=max(resolution, 64),
             up_axis=prior_up_axis,
+            up_candidates=prior_up_candidates,
+            depth_axis=prior_depth_axis,
+            input_view=prior_input[0],
+            input_camera=prior_input[1],
         )
         ious, dices = _silhouette_scores(
             mesh.vertices, mesh.faces, prior_poses, bool_masks, intrinsics

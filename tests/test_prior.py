@@ -142,3 +142,31 @@ def test_cli_prior_options(tmp_path, duck):
         [str(tmp_path), str(tmp_path / "o.glb"), "--prior-mesh", str(prior_path)]
     )
     assert code == cli.EXIT_ERROR  # default sfm mode does not take a prior
+
+
+def test_rotation_to_up_maps_any_direction_to_world_up():
+    from img2mesh.prior import rotation_to_up
+
+    rng = np.random.default_rng(3)
+    for direction in [*rng.normal(size=(5, 3)), [0.0, 1.0, 0.0], [0.0, -2.0, 0.0]]:
+        rot = rotation_to_up(direction)
+        unit = np.asarray(direction) / np.linalg.norm(direction)
+        np.testing.assert_allclose(rot @ unit, [0.0, 1.0, 0.0], atol=1e-9)
+        np.testing.assert_allclose(rot @ rot.T, np.eye(3), atol=1e-9)
+
+
+def test_backend_up_hints_and_mesh_cleaning():
+    from img2mesh.learned import backend_up_candidates, clean_mesh
+
+    tri = backend_up_candidates("triposr")
+    assert tri is not None and np.allclose(tri[0], [0.0, 0.0, 1.0])
+    register_backend("hinted", lambda: None, up_candidates=[(1.0, 0.0, 0.0)])
+    assert np.allclose(backend_up_candidates("hinted")[0], [1.0, 0.0, 0.0])
+    register_backend("hinted", lambda: None)
+    assert backend_up_candidates("hinted") is None
+
+    verts = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [2, 2, 2], [0.5, 0, 0]]
+    faces = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3], [0, 5, 1]]  # last: zero area
+    cleaned = clean_mesh(_mesh(verts, faces))
+    assert cleaned.face_count == 4
+    assert cleaned.vertex_count == 4  # unused vertices 4 and 5 dropped

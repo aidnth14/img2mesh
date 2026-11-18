@@ -6,9 +6,13 @@ imported when a backend is actually used, so the core package stays light.
 
 Built in:
 
-- ``"triposr"``: TripoSR (MIT licence). Needs ``torch`` and the TripoSR
-  package (``pip install git+https://github.com/VAST-AI-Research/TripoSR``);
-  the weights (``stabilityai/TripoSR``) download on first use.
+- ``"triposr"``: TripoSR (MIT licence). TripoSR is not a pip package: clone
+  https://github.com/VAST-AI-Research/TripoSR, put it on ``PYTHONPATH``, and
+  install ``torch omegaconf einops transformers==4.35.0 trimesh
+  huggingface-hub imageio rembg onnxruntime`` plus ``torchmcubes`` (built
+  from git with ``--no-build-isolation`` after ``scikit-build-core``). The
+  weights (``stabilityai/TripoSR``, ~1.7 GB) download on first use. Python
+  3.12 is the safest choice.
 
 Register others with :func:`register_backend`: a factory returning a callable
 ``(PIL RGBA image) -> MeshResult``.
@@ -16,7 +20,7 @@ Register others with :func:`register_backend`: a factory returning a callable
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import numpy as np
 from PIL import Image
@@ -26,14 +30,57 @@ from .mesh import MeshResult
 
 Backend = Callable[[Image.Image], MeshResult]
 _FACTORIES: dict[str, Callable[..., Backend]] = {}
+_UP_HINTS: dict[str, tuple[np.ndarray, ...]] = {}
+_DEPTH_AXES: dict[str, np.ndarray] = {}
+_INPUT_CAMERAS: dict[str, np.ndarray] = {}
 _CACHE: dict[tuple, Backend] = {}
 
 
-def register_backend(name: str, factory: Callable[..., Backend]) -> None:
-    """Make ``factory(**options) -> backend`` available under ``name``."""
+def register_backend(
+    name: str,
+    factory: Callable[..., Backend],
+    up_candidates: Sequence[Sequence[float]] | None = None,
+    depth_axis: Sequence[float] | None = None,
+    input_camera: Sequence[Sequence[float]] | None = None,
+) -> None:
+    """Make ``factory(**options) -> backend`` available under ``name``.
+
+    ``up_candidates`` lists plausible directions of the real-world up axis in
+    the backend's output frame (tried in turn); ``None`` means unknown.
+    ``depth_axis`` is the input camera's viewing axis in that frame: the
+    direction along which a single-image model's thickness guess is least
+    reliable, so it is rescaled to fit the other photos. ``input_camera`` is
+    the rotation (output frame to camera: x right, y down, z forward) from
+    which the generator sees its input photo; that photo's camera is then
+    known instead of searched for.
+    """
     _FACTORIES[name] = factory
+    if up_candidates is None:
+        _UP_HINTS.pop(name, None)
+    else:
+        _UP_HINTS[name] = tuple(np.asarray(u, dtype=np.float64) for u in up_candidates)
+    if depth_axis is None:
+        _DEPTH_AXES.pop(name, None)
+    else:
+        _DEPTH_AXES[name] = np.asarray(depth_axis, dtype=np.float64)
+    if input_camera is None:
+        _INPUT_CAMERAS.pop(name, None)
+    else:
+        _INPUT_CAMERAS[name] = np.asarray(input_camera, dtype=np.float64)
     for key in [k for k in _CACHE if k[0] == name]:
         del _CACHE[key]
+
+
+def backend_up_candidates(name: str) -> tuple[np.ndarray, ...] | None:
+    return _UP_HINTS.get(name)
+
+
+def backend_depth_axis(name: str) -> np.ndarray | None:
+    return _DEPTH_AXES.get(name)
+
+
+def backend_input_camera(name: str) -> np.ndarray | None:
+    return _INPUT_CAMERAS.get(name)
 
 
 def available_backends() -> list[str]:
@@ -54,6 +101,29 @@ def foreground_rgba(image: Image.Image, mask: np.ndarray) -> Image.Image:
     return Image.fromarray(rgba, mode="RGBA")
 
 
+def clean_mesh(mesh: MeshResult) -> MeshResult:
+    """Drop zero-area triangles and unreferenced vertices (common in
+    generator output, and rejected by the exporters)."""
+    vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    faces = np.asarray(mesh.faces, dtype=np.int64)
+    tri = vertices[faces]
+    area2 = np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1
+    )
+    scale = float(np.max(np.ptp(vertices, axis=0))) if len(vertices) else 1.0
+    faces = faces[area2 > 1e-12 * scale * scale]
+    used = np.unique(faces)
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    return MeshResult(
+        vertices=vertices[used],
+        faces=remap[faces],
+        alpha=None,
+        input_point_count=len(vertices),
+        retained_point_count=len(used),
+    )
+
+
 def generate_prior_mesh(
     image: Image.Image,
     mask: np.ndarray,
@@ -69,7 +139,7 @@ def generate_prior_mesh(
     key = (backend, tuple(sorted(options.items())))
     if key not in _CACHE:
         _CACHE[key] = _FACTORIES[backend](**options)
-    mesh = _CACHE[key](foreground_rgba(image, mask))
+    mesh = clean_mesh(_CACHE[key](foreground_rgba(image, mask)))
     if mesh.face_count < 4:
         raise ReconstructionError(f"The '{backend}' backend returned no surface.")
     return mesh
@@ -86,8 +156,8 @@ def _triposr_factory(
         from tsr.utils import resize_foreground
     except ImportError as exc:
         raise ConfigurationError(
-            "The TripoSR backend needs PyTorch and TripoSR: pip install torch "
-            "git+https://github.com/VAST-AI-Research/TripoSR"
+            "The TripoSR backend needs PyTorch, torchmcubes and a TripoSR "
+            "checkout on PYTHONPATH (see img2mesh.learned for setup steps)."
         ) from exc
 
     if device is None:
@@ -119,4 +189,19 @@ def _triposr_factory(
     return run
 
 
-register_backend("triposr", _triposr_factory)
+# TripoSR reconstructs in its input camera's frame: Z up, camera on +X looking
+# at the origin. A photo taken from elevation e therefore shows the object
+# with its true up axis tilted from +Z towards the camera by e.
+_TRIPOSR_UP = [
+    (float(np.sin(np.radians(e))), 0.0, float(np.cos(np.radians(e))))
+    for e in (0.0, 15.0, 30.0, 45.0, 60.0, 75.0)
+]
+# Verified against real output: the input photo's outline matches the mesh
+# seen from +X with +Y to the image right and +Z up, within a few degrees.
+register_backend(
+    "triposr",
+    _triposr_factory,
+    up_candidates=_TRIPOSR_UP,
+    depth_axis=(1.0, 0.0, 0.0),
+    input_camera=((0.0, 1.0, 0.0), (0.0, 0.0, -1.0), (-1.0, 0.0, 0.0)),
+)
