@@ -243,13 +243,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--shape-prior",
-        choices=("auto", "revolution", "none"),
+        choices=("auto", "best", "revolution", "none"),
         default="auto",
         help=(
             "Silhouette shape model: 'revolution' rebuilds rotationally "
             "symmetric objects (cups, bowls, vases) as a smooth hollow body "
             "plus handle; 'none' uses plain visual-hull carving; 'auto' picks "
-            "revolution when the views look symmetric (default: auto)."
+            "revolution when the views look symmetric; 'best' tries every "
+            "strategy, validates each on held-out photos, keeps the winner and "
+            "prints a quality report (slower) (default: auto)."
         ),
     )
     parser.add_argument(
@@ -361,6 +363,17 @@ def _run_silhouette(
         vh_result.min_iou * 100.0,
         vh_result.mean_dice * 100.0,
     )
+    if vh_result.quality is not None:
+        LOGGER.info("Strategies (held-out photo IoU):")
+        for name, score in sorted(vh_result.candidates, key=lambda c: -c[1]):
+            LOGGER.info("  %-18s %.3f", name, score)
+        LOGGER.info(
+            "Quality: %s (held-out IoU %.3f).",
+            vh_result.quality.upper(),
+            vh_result.holdout_iou,
+        )
+        for line in vh_result.advice:
+            LOGGER.info("Advice: %s", line)
     return vh_result.mesh
 
 

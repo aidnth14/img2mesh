@@ -436,6 +436,62 @@ def _shoe() -> BenchObject:
     )
 
 
+def _mannequin() -> BenchObject:
+    def pair(make):
+        return [make(1.0), make(-1.0)]
+
+    parts = [
+        ellipsoid((0, 0.885, 0.005), (0.055, 0.07, 0.06)),  # head
+        tapered_capsule((0, 0.77, 0), (0, 0.835, 0.004), 0.028, 0.024),  # neck
+        ellipsoid((0, 0.765, 0), (0.14, 0.035, 0.06)),  # shoulders
+        ellipsoid((0, 0.70, 0.004), (0.115, 0.09, 0.075)),  # chest
+        ellipsoid((0, 0.60, 0), (0.085, 0.06, 0.06)),  # waist
+        ellipsoid((0, 0.52, 0), (0.105, 0.075, 0.07)),  # hips
+    ]
+    parts += pair(
+        lambda s: tapered_capsule(
+            (s * 0.13, 0.755, 0), (s * 0.19, 0.60, -0.01), 0.031, 0.025
+        )
+    )
+    parts += pair(
+        lambda s: tapered_capsule(
+            (s * 0.19, 0.60, -0.01), (s * 0.225, 0.465, 0.015), 0.024, 0.018
+        )
+    )
+    parts += pair(lambda s: ellipsoid((s * 0.232, 0.43, 0.02), (0.016, 0.038, 0.026)))
+    parts += pair(
+        lambda s: tapered_capsule(
+            (s * 0.05, 0.50, 0), (s * 0.055, 0.27, 0.005), 0.046, 0.033
+        )
+    )
+    parts += pair(
+        lambda s: tapered_capsule(
+            (s * 0.055, 0.27, 0.005), (s * 0.058, 0.055, -0.005), 0.033, 0.022
+        )
+    )
+    parts += pair(lambda s: ellipsoid((s * 0.06, 0.04, 0.03), (0.026, 0.02, 0.058)))
+    body = smooth_union(parts, 0.02)
+    base = rounded_box((0, 0.008, 0.01), (0.16, 0.008, 0.13), 0.006)
+    skin, stand = (
+        _speckled((0.74, 0.56, 0.42), 0.06),
+        _speckled((0.22, 0.22, 0.24), 0.04),
+    )
+
+    def albedo(points: np.ndarray) -> np.ndarray:
+        return np.where((points[:, 1] < 0.02)[:, None], stand(points), skin(points))
+
+    return BenchObject(
+        "mannequin",
+        "other",
+        smooth_union([body, base], 0.0),
+        albedo,
+        _bounds([-0.27, 0.0, -0.14], [0.27, 0.96, 0.16]),
+        genus=1,  # legs + hips + base plate form one loop
+        hollow=False,
+        tags=("thin_parts",),
+    )
+
+
 BUILDERS: dict[str, Callable[[], BenchObject]] = {
     "cup": _cup,
     "bowl": _bowl,
@@ -447,6 +503,7 @@ BUILDERS: dict[str, Callable[[], BenchObject]] = {
     "box": _box,
     "toy_duck": _duck,
     "shoe": _shoe,
+    "mannequin": _mannequin,
 }
 
 

@@ -23,6 +23,8 @@ is visual-hull carving given the true view angles; ``prior`` refines a
 simulated learned prior (see :func:`simulated_learned_prior`) whose up axis is
 found automatically, ``prior_up`` the same prior with its up axis given, and
 ``learned`` a real TripoSR prior (optional dependencies required).
+``best`` / ``best_angles`` select a strategy automatically by held-out
+validation (without / with the true view angles).
 """
 
 from __future__ import annotations
@@ -171,6 +173,11 @@ def evaluate(
         if method == "prior_up":
             # Generators output a fixed, documented orientation (Z up here).
             kwargs["prior_up_axis"] = "+z"
+    elif method in ("best", "best_angles"):
+        # Automatic strategy selection by held-out validation.
+        kwargs["shape_prior"] = "best"
+        if method == "best_angles":
+            kwargs["view_angles"] = [(v.azimuth, v.elevation) for v in train]
     elif method == "learned":
         # A real learned generator (needs its optional dependencies).
         kwargs["shape_prior"] = "none"
@@ -237,7 +244,7 @@ def _fmt(value: float, spec: str) -> str:
 
 def format_table(results: Sequence[BenchResult]) -> str:
     header = (
-        f"{'object':11s} {'method':8s} {'used':11s} {'F@2%':>5s} {'P':>5s} "
+        f"{'object':11s} {'method':8s} {'used':18s} {'F@2%':>5s} {'P':>5s} "
         f"{'R':>5s} {'F@1%':>5s} {'CD%':>5s} {'genus':>6s} {'novel':>6s} "
         f"{'self':>5s} {'sec':>5s}"
     )
@@ -248,7 +255,7 @@ def format_table(results: Sequence[BenchResult]) -> str:
             continue
         genus = f"{r.genus}/{r.gt_genus}" if r.watertight else f"open/{r.gt_genus}"
         lines.append(
-            f"{r.object:11s} {r.method:8s} {r.used:11s} {_fmt(r.fscore, '.3f'):>5s} "
+            f"{r.object:11s} {r.method:8s} {r.used:18s} {_fmt(r.fscore, '.3f'):>5s} "
             f"{_fmt(r.precision, '.2f'):>5s} {_fmt(r.recall, '.2f'):>5s} "
             f"{_fmt(r.fscore_1pct, '.3f'):>5s} {_fmt(r.chamfer_pct, '.2f'):>5s} "
             f"{genus:>6s} {_fmt(r.novel_iou, '.3f'):>6s} "

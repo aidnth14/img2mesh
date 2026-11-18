@@ -52,6 +52,11 @@ class VisualHullResult:
     per_view_iou: tuple[float, ...]
     per_view_dice: tuple[float, ...]
     method: str = "visual_hull"
+    # Filled by shape_prior="best": held-out validation and a verdict.
+    holdout_iou: float | None = None
+    quality: str | None = None
+    advice: tuple[str, ...] = ()
+    candidates: tuple[tuple[str, float], ...] = ()
 
     @property
     def mean_iou(self) -> float:
@@ -770,7 +775,7 @@ def _known_view_poses(
     return poses
 
 
-SHAPE_PRIORS = ("auto", "revolution", "none")
+SHAPE_PRIORS = ("auto", "best", "revolution", "none")
 _AUTO_REVOLUTION_MIN_IOU = 0.75
 
 
@@ -874,6 +879,11 @@ def reconstruct_visual_hull(
       otherwise fall back to visual-hull carving.
     - ``"revolution"``: always use the surface-of-revolution model.
     - ``"none"``: always use visual-hull carving.
+    - ``"best"``: try every applicable strategy (revolution, carving, carving
+      with ``view_angles``, ``learned_backend`` prior), score each by
+      leave-one-out validation on held-out photos, build the winner and
+      report a quality verdict with advice (see :mod:`img2mesh.validate`).
+      Slower: several reconstructions per strategy.
 
     ``view_angles`` optionally gives each photo's camera (azimuth, elevation)
     in degrees, elevation positive when looking down (e.g. from a turntable
@@ -949,6 +959,39 @@ def reconstruct_visual_hull(
     if any(not np.any(m) for m in bool_masks):
         raise ReconstructionError(
             "Foreground segmentation produced an empty mask for one or more views."
+        )
+
+    if shape_prior == "best":
+        from dataclasses import replace
+
+        from .validate import quality_verdict, select_strategy
+
+        best, scores = select_strategy(
+            view_images,
+            bool_masks,
+            intrinsics,
+            view_angles=view_angles,
+            learned_backend=learned_backend,
+            prior_up_axis=prior_up_axis,
+            carve_concavity=carve_concavity,
+            resolution=resolution,
+        )
+        result = reconstruct_visual_hull(
+            view_images,
+            masks=bool_masks,
+            intrinsics=intrinsics,
+            resolution=resolution,
+            prior_mesh=prior_mesh,
+            **best.strategy.kwargs,
+        )
+        quality, advice = quality_verdict(best, bool_masks, view_angles)
+        return replace(
+            result,
+            method=f"best:{best.strategy.name}",
+            holdout_iou=best.holdout_iou,
+            quality=quality,
+            advice=advice,
+            candidates=tuple((s.strategy.name, s.holdout_iou) for s in scores),
         )
 
     prior_up_candidates = None

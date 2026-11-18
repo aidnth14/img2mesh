@@ -39,6 +39,10 @@
   (up-direction candidates, depth axis, input camera) so the input photo's
   camera is known and the prior's thickness is fitted. Benchmark `learned`
   method: non-round F@2% 0.45 (hull 0.36).
+- `shape_prior="best"` / `--shape-prior best`: leave-one-out validation of
+  every applicable strategy, automatic choice, and a quality verdict with
+  advice for a better photo set (`img2mesh.validate`). Benchmark gains a
+  mannequin (thin parts) and `best` / `best_angles` methods.
 - `img2mesh.io.load_mesh` reads .obj, .stl (binary/ASCII, welded) and .glb.
 - Marching tetrahedra no longer leaves pinholes when grid values sit within
   ~1e-7 of the iso-level.

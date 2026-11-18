@@ -70,6 +70,27 @@ at least one near side-on view (elevation below about 25°) and assumes the
 photos look at the object from the side or from above. GLB and OBJ exports
 carry per-vertex colour (STL has none).
 
+### Automatic strategy choice and quality report
+
+`--shape-prior best` tries every applicable strategy (revolution when the
+object looks round, carving, carving with `--view-angles`, a
+`--learned-prior`), scores each by leave-one-out validation (rebuild without
+a photo, then check how well the model explains it), builds the winner, and
+prints a verdict with advice:
+
+```text
+Strategies (held-out photo IoU):
+  revolution         0.968
+  carving            0.938
+Quality: GOOD (held-out IoU 0.968).
+```
+
+Carved results never rate better than "fair": silhouettes cannot show
+hollows or deep concave areas. Advice covers objects cut off at the image
+edge, missing view angles, photos all taken from one height, and too few
+photos (12 turntable photos instead of 6 lift the mannequin from F 0.80 to
+0.93). It is slower than `auto` (several reconstructions per strategy).
+
 ### Learned shape priors
 
 For arbitrary objects, a rough mesh from a single-image 3D generator
@@ -112,7 +133,7 @@ seventh held-out view. Self-reported IoU on the input views is shown only for
 contrast: carving-style methods score well on it even when the shape is wrong.
 
 ```bash
-python -m img2mesh.benchmark                                  # everything
+python -m img2mesh.benchmark                                  # everything (11 objects)
 python -m img2mesh.benchmark --objects cup,box --methods auto,none
 python -m img2mesh.benchmark --json results.json --save-meshes meshes/
 python -m img2mesh.benchmark --methods none,auto,angles,prior_up
@@ -153,8 +174,9 @@ Options:
   --alpha FLOAT             Alpha-shape radius (omit for convex hull)
   --mode {sfm,silhouette,auto}
                             Reconstruction mode (default: sfm)
-  --shape-prior {auto,revolution,none}
-                            Silhouette shape model (default: auto)
+  --shape-prior {auto,best,revolution,none}
+                            Silhouette shape model; 'best' validates and reports
+                            (default: auto)
   --view-angles AZ:EL,...   Known camera angles per photo (silhouette mode)
   --prior-mesh PATH         Shape prior mesh (.obj/.stl/.glb) to fit and refine
   --prior-up-axis {+x,-x,+y,-y,+z,-z}
@@ -185,6 +207,7 @@ src/img2mesh/
   revolve.py    Surface-of-revolution shape prior, pose fitting, vertex colours
   prior.py      Reconstruction guided by an external/learned prior mesh
   learned.py    Optional learned backends (TripoSR) producing prior meshes
+  validate.py   Leave-one-out validation, strategy selection, quality report
   benchmark/    Synthetic objects, renderer, shape metrics, benchmark runner
   silhouette.py Foreground masks, visual hull, marching tetrahedra
 tests/
@@ -198,6 +221,7 @@ tests/
   test_prior.py
   test_revolve.py
   test_silhouette.py
+  test_validate.py
 ```
 
 ## Testing & Linting
