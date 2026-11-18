@@ -67,13 +67,38 @@ def _view_record(view: RenderedView) -> dict:
 
 
 def _clean_true_mesh(mesh) -> MeshResult:
-    """Scans contain zero-area triangles, which exporters reject."""
-    v, f = mesh.vertices, mesh.faces
-    tri = v[f]
-    area2 = np.linalg.norm(
-        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1
-    )
-    f = f[area2 > 1e-14]
+    """Make a scan exportable: exporters need every vertex to have a normal.
+
+    Scans contain zero-area triangles, duplicated (double-sided) surfaces
+    whose normals cancel, and triangles that only collapse at float32
+    precision. Weld coincident vertices, drop duplicate and float32-degenerate
+    faces, then drop faces touching vertices whose normals still cancel.
+    """
+    v = np.asarray(mesh.vertices, dtype=np.float64)
+    colors = mesh.vertex_colors()
+    scale = float(np.max(np.ptp(v, axis=0))) or 1.0
+    keys = np.round(v / scale * 1e6).astype(np.int64)
+    _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    v, colors = v[first], colors[first]
+    f = inverse.reshape(-1)[np.asarray(mesh.faces)]
+    f = f[(f[:, 0] != f[:, 1]) & (f[:, 1] != f[:, 2]) & (f[:, 0] != f[:, 2])]
+    _, uniq = np.unique(np.sort(f, axis=1), axis=0, return_index=True)
+    f = f[np.sort(uniq)]
+    for _ in range(3):
+        v32 = v.astype(np.float32).astype(np.float64)
+        tri = v32[f]
+        fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        f = f[np.linalg.norm(fn, axis=1) > 1e-12 * scale * scale]
+        tri = v32[f]
+        fn = np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0])
+        normals = np.zeros_like(v)
+        for corner in range(3):
+            np.add.at(normals, f[:, corner], fn)
+        bad = np.linalg.norm(normals, axis=1) <= 1e-12 * scale * scale
+        touched = bad[f].any(axis=1)
+        if not touched.any():
+            break
+        f = f[~touched]
     used = np.unique(f)
     remap = np.full(len(v), -1, dtype=np.int64)
     remap[used] = np.arange(len(used))
@@ -81,9 +106,9 @@ def _clean_true_mesh(mesh) -> MeshResult:
         vertices=v[used],
         faces=remap[f],
         alpha=None,
-        input_point_count=len(v),
+        input_point_count=len(mesh.vertices),
         retained_point_count=len(used),
-        vertex_colors=mesh.vertex_colors()[used],
+        vertex_colors=colors[used],
     )
 
 
@@ -321,6 +346,7 @@ def _build_glb_one(entry: dict, folder: Path, glb: Path, size: int) -> None:
         "heldout_view": _view_record(held),
     }
     (folder / "meta.json").write_text(json.dumps(meta, indent=1))
+    (folder / "NOT_AVAILABLE.txt").unlink(missing_ok=True)  # from a failed pass
 
 
 # -------------------------------------------------------------- evaluate ---
