@@ -430,6 +430,34 @@ def marching_tetrahedra(
     return vertices, valid_faces
 
 
+def drop_small_components(
+    vertices: np.ndarray, faces: np.ndarray, fraction: float = 0.01
+) -> tuple[np.ndarray, np.ndarray]:
+    """Remove disconnected fragments smaller than ``fraction`` of the mesh.
+
+    Carving leaves specks where silhouettes disagree by a pixel or two; they
+    are noise, not parts of the object.
+    """
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]]))
+    n = len(vertices)
+    count, labels = connected_components(
+        coo_matrix((np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(n, n)),
+        directed=False,
+    )
+    if count <= 1:
+        return vertices, faces
+    sizes = np.bincount(labels, minlength=count)
+    keep_label = sizes >= max(fraction * n, 1)
+    keep_label[np.argmax(sizes)] = True
+    keep_vertex = keep_label[labels]
+    keep_face = keep_vertex[faces[:, 0]]
+    remap = np.cumsum(keep_vertex) - 1
+    return vertices[keep_vertex], remap[faces[keep_face]]
+
+
 def rasterize_mesh_silhouette(
     vertices: np.ndarray,
     faces: np.ndarray,
@@ -591,15 +619,25 @@ class _OrthoView:
         cy, cx = np.nonzero(crop)
         self.bbox = (cx.min(), cx.max(), cy.min(), cy.max())
 
-    def similarity(self, projected: np.ndarray) -> tuple[float, np.ndarray]:
-        """Scale/centre mapping projected points' bbox onto the mask bbox."""
-        px0, py0 = projected.min(axis=0)
-        px1, py1 = projected.max(axis=0)
+    def similarity(
+        self, projected: np.ndarray, pad: float = 0.0, vertical: bool = False
+    ) -> tuple[float, np.ndarray]:
+        """Scale/centre mapping projected points' bbox onto the mask bbox.
+
+        ``pad`` widens the points' bbox (in their units), e.g. by half a voxel
+        when the points are voxel centres. ``vertical`` takes the scale from
+        heights only, which thin sideways parts (arms) cannot disturb.
+        """
+        px0, py0 = projected.min(axis=0) - pad
+        px1, py1 = projected.max(axis=0) + pad
         mx0, mx1, my0, my1 = self.bbox
-        scale = 0.5 * (
-            (mx1 - mx0 + 1) / max(px1 - px0, 1e-9)
-            + (my1 - my0 + 1) / max(py1 - py0, 1e-9)
-        )
+        if vertical:
+            scale = (my1 - my0 + 1) / max(py1 - py0, 1e-9)
+        else:
+            scale = 0.5 * (
+                (mx1 - mx0 + 1) / max(px1 - px0, 1e-9)
+                + (my1 - my0 + 1) / max(py1 - py0, 1e-9)
+            )
         center = np.array([0.5 * (mx0 + mx1), 0.5 * (my0 + my1)]) - scale * 0.5 * (
             np.array([px0 + px1, py0 + py1])
         )
@@ -636,6 +674,8 @@ def _known_view_poses(
     intrinsics: CameraIntrinsics,
     *,
     iterations: int = 4,
+    vertical_scale: bool | None = None,
+    refine_offsets: bool = True,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Camera poses for known (azimuth, elevation) angles.
 
@@ -643,24 +683,76 @@ def _known_view_poses(
     alternating carving with bbox matching of the carved hull's projection
     onto each silhouette, then converted to the perspective camera model.
     """
-    views = [_OrthoView(m) for m in masks]
-    lin = np.linspace(-0.9, 0.9, 40)
+    # Placement errors of even a few pixels make the views carve away thin
+    # parts (arms, legs, necks), so place at (near) full resolution.
+    views = []
+    for m in masks:
+        ys, xs = np.nonzero(m)
+        span = max(np.ptp(xs), np.ptp(ys)) * 1.3 + 2
+        views.append(_OrthoView(m, size=int(min(span, 400))))
+    lin = np.linspace(-0.9, 0.9, 72)
+    pad = 0.5 * (lin[1] - lin[0])
     gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
     pts = np.column_stack((gx.ravel(), gy.ravel(), gz.ravel()))
     rots = [_ortho_rotation(az, el) for az, el in angles]
     projected = [pts @ rot[:2].T for rot in rots]
-    occ = np.ones(len(pts), dtype=bool)
-    placements = []
-    for _ in range(iterations):
-        placements = []
-        carved = np.ones(len(pts), dtype=bool)
-        for view, proj in zip(views, projected, strict=True):
-            scale, center = view.similarity(proj[occ])
-            placements.append((scale, center))
-            carved &= view.inside(view.pixels(proj * scale + center))
-        if not carved.any():
-            break
-        occ = carved
+
+    def carve(places) -> np.ndarray:
+        kept = np.ones(len(pts), dtype=bool)
+        for view, proj, (scale, center) in zip(views, projected, places, strict=True):
+            kept &= view.inside(view.pixels(proj * scale + center))
+        return kept
+
+    def overlap(places, kept) -> float:
+        if not kept.any():
+            return 0.0
+        return float(
+            np.mean(
+                [
+                    view.iou(view.pixels(proj[kept] * scale + center))
+                    for view, proj, (scale, center) in zip(
+                        views, projected, places, strict=True
+                    )
+                ]
+            )
+        )
+
+    def place(vertical: bool) -> tuple[list[tuple[float, np.ndarray]], float]:
+        occ = np.ones(len(pts), dtype=bool)
+        placements: list[tuple[float, np.ndarray]] = []
+        for _ in range(iterations):
+            placements = [
+                view.similarity(proj[occ], pad=pad, vertical=vertical)
+                for view, proj in zip(views, projected, strict=True)
+            ]
+            carved = carve(placements)
+            if not carved.any():
+                break
+            occ = carved
+
+        # Sideways offsets: a view shifted against the others carves away
+        # parts they need, so pick each view's shift that keeps all fullest.
+        best = overlap(placements, occ)
+        for step in (4.0, 2.0, 1.0) if refine_offsets else ():
+            for idx, view in enumerate(views):
+                for direction in (-1.0, 1.0):
+                    while True:
+                        trial = list(placements)
+                        scale, center = trial[idx]
+                        shift = np.array([direction * step * view.k * 2.0, 0.0])
+                        trial[idx] = (scale, center + shift)
+                        kept = carve(trial)
+                        score = overlap(trial, kept)
+                        if score <= best + 1e-4:
+                            break
+                        best, placements, occ = score, trial, kept
+        return placements, best
+
+    # Whole-bbox scaling suits compact objects; height-only scaling survives
+    # thin sideways parts (arms) that whole-bbox matching carves away. Keep
+    # whichever leaves a hull that fills every silhouette best.
+    modes = (False, True) if vertical_scale is None else (vertical_scale,)
+    placements = max((place(mode) for mode in modes), key=lambda r: r[1])[0]
 
     poses = []
     for view, rot, (scale, center) in zip(views, rots, placements, strict=True):
@@ -1098,6 +1190,7 @@ def reconstruct_visual_hull(
     )
     from .revolve import project_vertex_colors, taubin_smooth
 
+    vertices, faces = drop_small_components(vertices, faces)
     vertices = taubin_smooth(vertices, faces)
 
     per_view_iou, per_view_dice = _silhouette_scores(
