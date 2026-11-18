@@ -435,6 +435,12 @@ def marching_tetrahedra(
     return vertices, valid_faces
 
 
+def _rembg_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("rembg") is not None
+
+
 def drop_small_components(
     vertices: np.ndarray, faces: np.ndarray, fraction: float = 0.01
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -870,6 +876,7 @@ def reconstruct_visual_hull(
     prior_up_axis: str | None = None,
     learned_backend: str | None = None,
     hollow: bool | None = None,
+    masker: str = "auto",
 ) -> VisualHullResult:
     """Reconstruct a watertight 3D mesh from multi-view silhouettes.
 
@@ -897,6 +904,10 @@ def reconstruct_visual_hull(
     :mod:`img2mesh.prior`). ``prior_up_axis`` names its up axis if known.
     ``learned_backend`` (e.g. ``"triposr"``) generates that prior from the
     photo with the largest silhouette (see :mod:`img2mesh.learned`).
+    ``masker`` picks the background removal when ``masks`` are not given:
+    ``"color"`` (backdrop colour distance, no extra dependencies),
+    ``"rembg"`` (learned, optional; far better on white or pale objects), or
+    ``"auto"`` (rembg when installed, otherwise colour).
     ``hollow`` forces the revolution model's top open (True) or closed
     (False); by default it is detected (and closed if ``carve_concavity`` is
     False).
@@ -957,8 +968,16 @@ def reconstruct_visual_hull(
         if len(masks) != len(view_images):
             raise InputError("Mask count must match the number of images.")
         bool_masks = tuple(np.asarray(m) > 0 for m in masks)
-    else:
+    elif masker == "rembg" or (masker == "auto" and _rembg_available()):
+        from .learned import rembg_mask
+
+        bool_masks = tuple(rembg_mask(img) for img in view_images)
+    elif masker == "auto":
         bool_masks = tuple(extract_foreground_mask(img) > 0 for img in view_images)
+    elif masker == "color":
+        bool_masks = tuple(extract_foreground_mask(img) > 0 for img in view_images)
+    else:
+        raise ConfigurationError("masker must be 'auto', 'color' or 'rembg'.")
 
     if any(not np.any(m) for m in bool_masks):
         raise ReconstructionError(

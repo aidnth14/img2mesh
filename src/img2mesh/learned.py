@@ -205,3 +205,25 @@ register_backend(
     depth_axis=(1.0, 0.0, 0.0),
     input_camera=((0.0, 1.0, 0.0), (0.0, 0.0, -1.0), (-1.0, 0.0, 0.0)),
 )
+
+
+_REMBG_SESSIONS: dict[str, object] = {}
+
+
+def rembg_mask(image: Image.Image, model: str = "u2net") -> np.ndarray:
+    """Foreground mask from rembg (U^2-Net), optional dependency.
+
+    Learned segmentation copes with white or pale objects on white
+    backgrounds, where colour-distance rules fail (on meshref: mean IoU
+    0.986 vs 0.963, and 3 vs 26 photos below 0.95).
+    """
+    try:
+        from rembg import new_session, remove
+    except ImportError as exc:
+        raise ConfigurationError(
+            "The rembg masker needs: pip install rembg onnxruntime"
+        ) from exc
+    if model not in _REMBG_SESSIONS:
+        _REMBG_SESSIONS[model] = new_session(model)
+    alpha = remove(image.convert("RGB"), session=_REMBG_SESSIONS[model], only_mask=True)
+    return np.asarray(alpha) > 127

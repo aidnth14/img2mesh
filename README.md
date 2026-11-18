@@ -91,6 +91,17 @@ edge, missing view angles, photos all taken from one height, and too few
 photos (12 turntable photos instead of 6 lift the mannequin from F 0.80 to
 0.93). It is slower than `auto` (several reconstructions per strategy).
 
+### Background removal
+
+Silhouette mode needs a clean object outline in every photo. The default
+`--masker color` measures each pixel's distance from the backdrop colour
+and needs no extra packages, but it struggles with white or pale objects on
+white backgrounds (labels, caps, packaging). `--masker rembg` uses a learned
+model (U^2-Net via `pip install rembg onnxruntime`): on the meshref photos it
+reaches a mean outline IoU of 0.986 against 0.963, with 3 photos below 0.95
+instead of 26, and lifts img2mesh's test accuracy on meshref from F 0.30 to
+0.54. The default, `--masker auto`, uses rembg whenever it is installed.
+
 ### Learned shape priors
 
 For arbitrary objects, a rough mesh from a single-image 3D generator
@@ -202,6 +213,8 @@ Options:
   --prior-up-axis {+x,-x,+y,-y,+z,-z}
                             Up axis of the prior mesh, if known
   --learned-prior BACKEND   Generate the prior with a learned backend
+  --masker {auto,color,rembg}
+                            Background removal (auto: rembg if installed)
   --no-bundle-adjustment    Skip bundle adjustment refinement
   --focal-length FLOAT      Camera focal length in pixels
   --max-dimension INT       Resize images so max(width, height) <= INT

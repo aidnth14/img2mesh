@@ -170,3 +170,16 @@ def test_backend_up_hints_and_mesh_cleaning():
     cleaned = clean_mesh(_mesh(verts, faces))
     assert cleaned.face_count == 4
     assert cleaned.vertex_count == 4  # unused vertices 4 and 5 dropped
+
+
+def test_masker_option_validation_and_optional_dependency():
+    images = [Image.new("RGB", (48, 48), "white") for _ in range(2)]
+    with pytest.raises(ConfigurationError, match="masker"):
+        reconstruct_visual_hull(images, masker="magic")
+    if importlib.util.find_spec("rembg") is None:
+        with pytest.raises(ConfigurationError, match="rembg"):
+            reconstruct_visual_hull(images, masker="rembg")
+    assert (
+        cli.build_parser().parse_args(["a", "b.glb", "--masker", "rembg"]).masker
+        == "rembg"
+    )

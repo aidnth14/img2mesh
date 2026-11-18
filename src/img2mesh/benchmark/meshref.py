@@ -266,7 +266,7 @@ def _rendered(image, mask, rec, intrinsics_cls) -> RenderedView:
     )
 
 
-def evaluate_object(folder: Path, resolution: int = 88) -> dict:
+def evaluate_object(folder: Path, resolution: int = 88, masker: str = "color") -> dict:
     """Decision features plus the true accuracy of every possible outcome."""
     import importlib
 
@@ -276,8 +276,15 @@ def evaluate_object(folder: Path, resolution: int = 88) -> dict:
 
     run = importlib.import_module("img2mesh.benchmark.run")
 
+    from dataclasses import replace as _replace
+
     views, meta = _load_views(folder)
+    if masker == "rembg":
+        from ..learned import rembg_mask
+
+        views = [_replace(v, mask=rembg_mask(v.image)) for v in views[:-1]] + views[-1:]
     train = views[:-1]
+    masks = [v.mask for v in train]
     true = load_mesh(folder / "true_model.glb")
     gt = (true.vertices, true.faces)
     subject = _Subject(folder.name, meta["category"])
@@ -303,7 +310,12 @@ def evaluate_object(folder: Path, resolution: int = 88) -> dict:
     for outcome, (method, extra) in plans.items():
         start = time.perf_counter()
         res = run.evaluate(
-            subject, views, gt, method, resolution=resolution, extra=extra
+            subject,
+            views,
+            gt,
+            method,
+            resolution=resolution,
+            extra={**extra, "masks": masks},
         )
         record["outcomes"][outcome] = (
             None
@@ -318,14 +330,15 @@ def evaluate_object(folder: Path, resolution: int = 88) -> dict:
     return record
 
 
-def evaluate(out_dir: Path, workers: int = 4) -> None:
-    cache = out_dir / "eval_records"
+def evaluate(out_dir: Path, workers: int = 4, masker: str = "color") -> None:
+    name = "eval_records" if masker == "color" else f"eval_records_{masker}"
+    cache = out_dir / name
     cache.mkdir(exist_ok=True)
     folders = sorted(p for p in out_dir.iterdir() if (p / "meta.json").is_file())
     todo = [f for f in folders if not (cache / f"{f.name}.json").is_file()]
     print(f"evaluating {len(todo)} of {len(folders)} objects with {workers} workers")
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(evaluate_object, f): f for f in todo}
+        futures = {pool.submit(evaluate_object, f, 88, masker): f for f in todo}
         for done, future in enumerate(as_completed(futures), start=1):
             folder = futures[future]
             try:
@@ -367,12 +380,13 @@ def _score(records: Sequence[dict], params: dict) -> float:
     return total / max(len(records), 1)
 
 
-def calibrate(out_dir: Path) -> dict:
+def calibrate(out_dir: Path, masker: str = "color") -> dict:
     from .. import revolve
 
     split = json.loads((out_dir / "split.json").read_text())
     records = {}
-    for path in (out_dir / "eval_records").glob("*.json"):
+    records_dir = "eval_records" if masker == "color" else f"eval_records_{masker}"
+    for path in (out_dir / records_dir).glob("*.json"):
         rec = json.loads(path.read_text())
         if "error" not in rec:
             records[rec["object"]] = rec
@@ -446,7 +460,9 @@ def calibrate(out_dir: Path) -> dict:
             for r in test
         },
     }
-    (out_dir / "calibration.json").write_text(json.dumps(report, indent=1))
+    report["masker"] = masker
+    name = "calibration.json" if masker == "color" else f"calibration_{masker}.json"
+    (out_dir / name).write_text(json.dumps(report, indent=1))
     return report
 
 
@@ -480,8 +496,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     e = sub.add_parser("evaluate")
     e.add_argument("out_dir", type=Path)
     e.add_argument("--workers", type=int, default=4)
+    e.add_argument("--masker", choices=("color", "rembg"), default="color")
     c = sub.add_parser("calibrate")
     c.add_argument("out_dir", type=Path)
+    c.add_argument("--masker", choices=("color", "rembg"), default="color")
     r = sub.add_parser("reconstruct")
     r.add_argument("out_dir", type=Path)
     a = sub.add_parser("add-artifact")
@@ -492,11 +510,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "build":
         build(args.raw_dir, args.chosen_json, args.out_dir)
     elif args.command == "evaluate":
-        evaluate(args.out_dir, args.workers)
+        evaluate(args.out_dir, args.workers, args.masker)
     elif args.command == "add-artifact":
         print(add_artifact(args.name, args.out_dir, args.number))
     elif args.command == "calibrate":
-        print(json.dumps(calibrate(args.out_dir), indent=1))
+        print(json.dumps(calibrate(args.out_dir, args.masker), indent=1))
     else:
         reconstruct(args.out_dir)
     return 0

@@ -266,6 +266,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--masker",
+        choices=("auto", "color", "rembg"),
+        default="auto",
+        help=(
+            "Background removal for silhouette mode: 'rembg' (learned; needs "
+            "rembg + onnxruntime; much better for white or pale objects on white "
+            "backgrounds), 'color' (no extra packages), or 'auto' (rembg if "
+            "installed, else color; default)."
+        ),
+    )
+    parser.add_argument(
         "--prior-mesh",
         type=Path,
         default=None,
@@ -488,6 +499,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reconstruction_kwargs["masks"] = masks
 
         prior_options = {}
+        if args.masker != "auto":
+            prior_options["masker"] = args.masker
         if args.prior_mesh is not None:
             prior_options["prior_mesh"] = load_mesh(args.prior_mesh)
         if args.prior_up_axis is not None:
