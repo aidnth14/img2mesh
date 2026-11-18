@@ -17,6 +17,9 @@ cameras, refined by ICP) and scored with:
 - genus and watertightness against the ground truth,
 - silhouette IoU from the held-out view (never seen by the method),
 - the method's self-reported IoU on its own input views, for contrast.
+
+Methods: ``auto`` / ``revolution`` / ``none`` are the shape priors; ``angles``
+is visual-hull carving given the true view angles.
 """
 
 from __future__ import annotations
@@ -124,11 +127,14 @@ def evaluate(
     gt_pts = sample_surface(gt_v, gt_f, SAMPLES, seed=1)
     diagonal = float(np.linalg.norm(np.ptp(gt_v, axis=0)))
 
+    kwargs = {"resolution": resolution, "shape_prior": method}
+    if method == "angles":
+        # Visual hull given the true view angles (as from a turntable rig).
+        kwargs["shape_prior"] = "none"
+        kwargs["view_angles"] = [(v.azimuth, v.elevation) for v in train]
     start = time.perf_counter()
     try:
-        recon = reconstruct_visual_hull(
-            [v.image for v in train], resolution=resolution, shape_prior=method
-        )
+        recon = reconstruct_visual_hull([v.image for v in train], **kwargs)
     except Exception as exc:  # report, keep benchmarking
         result.error = f"{type(exc).__name__}: {exc}"
         result.seconds = time.perf_counter() - start

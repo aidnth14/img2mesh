@@ -54,7 +54,15 @@ feature matching finds too little texture for structure-from-motion:
 img2mesh ./photos ./model.glb --mode silhouette                       # auto shape prior
 img2mesh ./photos ./model.glb --mode silhouette --shape-prior revolution
 img2mesh ./photos ./model.glb --mode silhouette --shape-prior none     # plain visual hull
+img2mesh ./photos ./model.glb --mode silhouette --view-angles 0:10,60:10,120:10,180:10,240:10,300:10
 ```
+
+For objects that are not round, silhouettes alone cannot pin down the camera
+poses (many wrong pose sets carve shapes consistent with every outline). If
+the angles are known, for example from a turntable, pass them with
+`--view-angles` (azimuth:elevation per photo in input order, elevation > 0
+looking down): on the benchmark this roughly doubles shape accuracy for the
+non-round objects.
 
 The revolution prior handles rims, necks, lids, knobs and caps, any number of
 handles and spouts on either side, and open (hollow) or closed tops. It needs
@@ -97,6 +105,7 @@ Options:
                             Reconstruction mode (default: sfm)
   --shape-prior {auto,revolution,none}
                             Silhouette shape model (default: auto)
+  --view-angles AZ:EL,...   Known camera angles per photo (silhouette mode)
   --no-bundle-adjustment    Skip bundle adjustment refinement
   --focal-length FLOAT      Camera focal length in pixels
   --max-dimension INT       Resize images so max(width, height) <= INT

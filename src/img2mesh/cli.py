@@ -145,6 +145,21 @@ def _positive_float(value: str) -> float:
     return result
 
 
+def _view_angles(value: str) -> list[tuple[float, float]]:
+    angles = []
+    for item in value.split(","):
+        try:
+            az, el = (float(part) for part in item.split(":"))
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "Use azimuth:elevation pairs separated by commas, e.g. 0:10,90:10."
+            ) from exc
+        if not (math.isfinite(az) and math.isfinite(el)) or abs(el) > 90.0:
+            raise argparse.ArgumentTypeError("Elevations must lie within [-90, 90].")
+        angles.append((az, el))
+    return angles
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="img2mesh",
@@ -237,6 +252,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--view-angles",
+        type=_view_angles,
+        default=None,
+        metavar="AZ:EL,...",
+        help=(
+            "Known camera angles per photo in input order, as azimuth:elevation "
+            "degrees (elevation > 0 looks down), e.g. 0:10,45:10,90:10. Makes "
+            "silhouette carving far more accurate for non-round objects."
+        ),
+    )
+    parser.add_argument(
         "--no-bundle-adjustment",
         action="store_true",
         help="Skip bundle adjustment refinement.",
@@ -281,8 +307,15 @@ def _close_images(images) -> None:
             LOGGER.warning("Could not close an input image cleanly.")
 
 
-def _run_silhouette(images, reconstruction_kwargs, shape_prior: str):
+def _run_silhouette(images, reconstruction_kwargs, shape_prior: str, view_angles=None):
     vh_kwargs = {"shape_prior": shape_prior}
+    if view_angles is not None:
+        if len(view_angles) != len(images):
+            raise InputError(
+                f"--view-angles lists {len(view_angles)} angle(s) for "
+                f"{len(images)} image(s)."
+            )
+        vh_kwargs["view_angles"] = view_angles
     if "intrinsics" in reconstruction_kwargs:
         vh_kwargs["intrinsics"] = reconstruction_kwargs["intrinsics"]
     if "masks" in reconstruction_kwargs:
@@ -410,7 +443,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 reconstruction_kwargs["masks"] = masks
 
         if args.mode == "silhouette":
-            mesh = _run_silhouette(images, reconstruction_kwargs, args.shape_prior)
+            mesh = _run_silhouette(
+                images, reconstruction_kwargs, args.shape_prior, args.view_angles
+            )
         else:
             reconstruction = None
             sfm_error = None
@@ -424,20 +459,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     raise
                 sfm_error = exc
 
-            if (
-                args.mode == "auto"
-                and (
-                    reconstruction is None
-                    or reconstruction.camera_count < len(images)
-                    or reconstruction.point_count < 32
-                )
+            if args.mode == "auto" and (
+                reconstruction is None
+                or reconstruction.camera_count < len(images)
+                or reconstruction.point_count < 32
             ):
                 LOGGER.info(
                     "Falling back to silhouette visual-hull reconstruction%s.",
                     f" ({sfm_error})" if sfm_error else "",
                 )
                 mesh = _run_silhouette(
-                    images, reconstruction_kwargs, args.shape_prior
+                    images, reconstruction_kwargs, args.shape_prior, args.view_angles
                 )
             else:
                 LOGGER.info(

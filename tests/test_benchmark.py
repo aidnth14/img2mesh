@@ -95,3 +95,27 @@ def test_benchmark_evaluate_scores_round_prior_above_visual_hull():
     assert auto.fscore > hull.fscore + 0.2
     assert auto.genus == obj.genus and auto.watertight
     assert 0.0 <= auto.novel_iou <= 1.0
+
+
+def test_known_view_angles_beat_blind_pose_search_on_non_round_object():
+    obj = get_object("toy_duck")
+    views = render_views(obj, size=160)
+    gt = ground_truth_mesh(obj, resolution=96)
+    blind = evaluate(obj, views, gt, "none", resolution=56)
+    known = evaluate(obj, views, gt, "angles", resolution=56)
+    assert blind.error == "" and known.error == ""
+    assert known.fscore > blind.fscore + 0.15
+    assert known.watertight
+
+
+def test_view_angles_validation():
+    from PIL import Image
+
+    from img2mesh.config import ConfigurationError
+    from img2mesh.silhouette import reconstruct_visual_hull
+
+    images = [Image.new("RGB", (64, 64), "white") for _ in range(2)]
+    with pytest.raises(ConfigurationError, match="per image"):
+        reconstruct_visual_hull(images, view_angles=[(0.0, 10.0)])
+    with pytest.raises(ConfigurationError, match="Elevations"):
+        reconstruct_visual_hull(images, view_angles=[(0.0, 10.0), (90.0, 120.0)])

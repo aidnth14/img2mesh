@@ -169,4 +169,27 @@ def test_cli_shape_prior_option(tmp_path):
     first_vertex = next(
         line for line in out.read_text().splitlines() if line.startswith("v ")
     )
-    assert len(first_vertex.split()) == 4  # plain hull carries no colours
+    assert len(first_vertex.split()) == 7  # x y z r g b: carved hulls are coloured
+
+
+def test_cli_view_angles_parsing(tmp_path):
+    parser = cli.build_parser()
+    args = parser.parse_args(["a", "b.glb", "--view-angles", "0:10,90:5.5"])
+    assert args.view_angles == [(0.0, 10.0), (90.0, 5.5)]
+    with pytest.raises(SystemExit):
+        parser.parse_args(["a", "b.glb", "--view-angles", "0-10"])
+
+    images, _, _ = _make_synthetic_cup_views()
+    for idx, image in enumerate(images):
+        image.save(tmp_path / f"view_{idx:02d}.png")
+    code = cli.main(
+        [
+            str(tmp_path),
+            str(tmp_path / "x.glb"),
+            "--mode",
+            "silhouette",
+            "--view-angles",
+            "0:0,10:10",
+        ]
+    )
+    assert code == cli.EXIT_ERROR  # 2 angles for 6 images

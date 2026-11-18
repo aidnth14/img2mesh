@@ -133,12 +133,8 @@ def _inflate_anchor_thickness(
     bbox_h: float,
 ) -> np.ndarray:
     kernel_size = max(5, int(round(0.22 * min(bbox_w, bbox_h))) | 1)
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-    )
-    body = (
-        cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel) > 0
-    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    body = cv2.morphologyEx(mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel) > 0
     body_thickness = _horizontal_thickness_map(body)
     appendage_thickness = 1.2 * distance_transform_edt(mask)
     return np.where(body, body_thickness, appendage_thickness)
@@ -241,9 +237,7 @@ def _evaluate_pose_silhouette(
     v_clip = np.clip(np.round(v).astype(np.int32), 0, height - 1)
     outside_penalty = float(np.mean(dist_outside[v_clip, u_clip]))
     scale_penalty = (
-        0.0
-        if base_tz is None
-        else 0.15 * ((translation[2] - base_tz) / base_tz) ** 2
+        0.0 if base_tz is None else 0.15 * ((translation[2] - base_tz) / base_tz) ** 2
     )
     roll_penalty = 0.0002 * (roll_deg**2)
     return -iou + 0.03 * outside_penalty + scale_penalty + roll_penalty
@@ -367,9 +361,7 @@ def marching_tetrahedra(
     d_a = np.array([[0, 0, 1, 1]])
     d_b = np.array([[2, 3, 2, 3]])
 
-    edge_rows = np.concatenate(
-        (np.repeat(s_rows, 3), np.repeat(d_rows, 4))
-    )
+    edge_rows = np.concatenate((np.repeat(s_rows, 3), np.repeat(d_rows, 4)))
     edge_a = np.concatenate(
         (s_a.ravel(), np.broadcast_to(d_a, (len(d_rows), 4)).ravel())
     )
@@ -401,9 +393,7 @@ def marching_tetrahedra(
     n_single = 3 * len(s_rows)
     s_tris = edge_vertex[:n_single].reshape(-1, 3)
     d_quads = edge_vertex[n_single:].reshape(-1, 4)  # v00, v01, v10, v11
-    d_tris = np.concatenate(
-        (d_quads[:, [0, 1, 3]], d_quads[:, [0, 3, 2]]), axis=0
-    )
+    d_tris = np.concatenate((d_quads[:, [0, 1, 3]], d_quads[:, [0, 3, 2]]), axis=0)
     faces = np.concatenate((s_tris, d_tris), axis=0)
     tri_rows = np.concatenate((s_rows, d_rows, d_rows))
 
@@ -518,12 +508,8 @@ def _carve_top_cavity(
     r_top, t_top = poses[top_idx]
     y_min, y_max = float(occ_pts[:, 1].min()), float(occ_pts[:, 1].max())
     cam_top = occ_pts @ r_top.T + t_top.reshape(1, 3)
-    near_ymin = float(
-        cam_top[occ_pts[:, 1] < y_min + 0.2 * (y_max - y_min), 2].mean()
-    )
-    near_ymax = float(
-        cam_top[occ_pts[:, 1] > y_max - 0.2 * (y_max - y_min), 2].mean()
-    )
+    near_ymin = float(cam_top[occ_pts[:, 1] < y_min + 0.2 * (y_max - y_min), 2].mean())
+    near_ymax = float(cam_top[occ_pts[:, 1] > y_max - 0.2 * (y_max - y_min), 2].mean())
 
     if near_ymin < near_ymax:
         rim_mask_pts = occ_pts[:, 1] < (y_min + 0.22 * (y_max - y_min))
@@ -568,6 +554,128 @@ def _carve_top_cavity(
     occ_indices = np.flatnonzero(occupied)
     updated[occ_indices[carve_mask]] = False
     return updated
+
+
+def _ortho_rotation(azimuth: float, elevation: float) -> np.ndarray:
+    """World (Y up) to camera (x right, y down, z forward) rotation."""
+    az, el = np.radians(azimuth), np.radians(elevation)
+    forward = -np.array([np.sin(az) * np.cos(el), np.sin(el), np.cos(az) * np.cos(el)])
+    up = np.array([0.0, 1.0, 0.0])
+    if abs(forward @ up) > 0.999:
+        up = np.array([0.0, 0.0, -1.0])
+    right = np.cross(forward, up)
+    right /= np.linalg.norm(right)
+    return np.vstack((right, np.cross(forward, right), forward))
+
+
+class _OrthoView:
+    """A mask cropped to a small square for the global pose search."""
+
+    def __init__(self, mask: np.ndarray, size: int = 48) -> None:
+        ys, xs = np.nonzero(mask)
+        x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+        span = max(x1 - x0, y1 - y0) * 1.3 + 2
+        self.offset = np.array(
+            [0.5 * (x0 + x1) - 0.5 * span, 0.5 * (y0 + y1) - 0.5 * span]
+        )
+        self.k = size / span
+        self.size = size
+        h, w = mask.shape
+        grid = (np.arange(size) + 0.5) / self.k
+        sx = np.clip(np.round(self.offset[0] + grid).astype(int), 0, w - 1)
+        sy = np.clip(np.round(self.offset[1] + grid).astype(int), 0, h - 1)
+        inside_x = (self.offset[0] + grid >= 0) & (self.offset[0] + grid < w)
+        inside_y = (self.offset[1] + grid >= 0) & (self.offset[1] + grid < h)
+        crop = mask[np.ix_(sy, sx)] & inside_y[:, None] & inside_x[None, :]
+        self.mask = crop
+        cy, cx = np.nonzero(crop)
+        self.bbox = (cx.min(), cx.max(), cy.min(), cy.max())
+
+    def similarity(self, projected: np.ndarray) -> tuple[float, np.ndarray]:
+        """Scale/centre mapping projected points' bbox onto the mask bbox."""
+        px0, py0 = projected.min(axis=0)
+        px1, py1 = projected.max(axis=0)
+        mx0, mx1, my0, my1 = self.bbox
+        scale = 0.5 * (
+            (mx1 - mx0 + 1) / max(px1 - px0, 1e-9)
+            + (my1 - my0 + 1) / max(py1 - py0, 1e-9)
+        )
+        center = np.array([0.5 * (mx0 + mx1), 0.5 * (my0 + my1)]) - scale * 0.5 * (
+            np.array([px0 + px1, py0 + py1])
+        )
+        return float(scale), center
+
+    def pixels(self, uv: np.ndarray) -> np.ndarray:
+        ui = np.round(uv[:, 0]).astype(np.int64)
+        vi = np.round(uv[:, 1]).astype(np.int64)
+        ok = (ui >= 0) & (ui < self.size) & (vi >= 0) & (vi < self.size)
+        return np.where(ok, vi * self.size + ui, -1)
+
+    def inside(self, pix: np.ndarray) -> np.ndarray:
+        flat = self.mask.ravel()
+        return np.where(pix >= 0, flat[np.maximum(pix, 0)], False)
+
+    def iou(self, pix: np.ndarray) -> float:
+        img = np.zeros(self.size * self.size, dtype=np.uint8)
+        img[pix[pix >= 0]] = 1
+        img = cv2.morphologyEx(
+            img.reshape(self.size, self.size),
+            cv2.MORPH_CLOSE,
+            np.ones((3, 3), np.uint8),
+        )
+        sil = img > 0
+        return float(
+            np.count_nonzero(sil & self.mask)
+            / max(np.count_nonzero(sil | self.mask), 1)
+        )
+
+
+def _known_view_poses(
+    masks: Sequence[np.ndarray],
+    angles: Sequence[tuple[float, float]],
+    intrinsics: CameraIntrinsics,
+    *,
+    iterations: int = 4,
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Camera poses for known (azimuth, elevation) angles.
+
+    Only each view's scale and centring are unknown. They are fitted by
+    alternating carving with bbox matching of the carved hull's projection
+    onto each silhouette, then converted to the perspective camera model.
+    """
+    views = [_OrthoView(m) for m in masks]
+    lin = np.linspace(-0.9, 0.9, 40)
+    gx, gy, gz = np.meshgrid(lin, lin, lin, indexing="ij")
+    pts = np.column_stack((gx.ravel(), gy.ravel(), gz.ravel()))
+    rots = [_ortho_rotation(az, el) for az, el in angles]
+    projected = [pts @ rot[:2].T for rot in rots]
+    occ = np.ones(len(pts), dtype=bool)
+    placements = []
+    for _ in range(iterations):
+        placements = []
+        carved = np.ones(len(pts), dtype=bool)
+        for view, proj in zip(views, projected, strict=True):
+            scale, center = view.similarity(proj[occ])
+            placements.append((scale, center))
+            carved &= view.inside(view.pixels(proj * scale + center))
+        if not carved.any():
+            break
+        occ = carved
+
+    poses = []
+    for view, rot, (scale, center) in zip(views, rots, placements, strict=True):
+        s_full = scale / view.k
+        c_full = center / view.k + view.offset
+        tz = intrinsics.fx / s_full
+        trans = np.array(
+            [
+                (c_full[0] - intrinsics.cx) / s_full,
+                (c_full[1] - intrinsics.cy) / s_full,
+                tz,
+            ]
+        )
+        poses.append((rot, trans))
+    return poses
 
 
 SHAPE_PRIORS = ("auto", "revolution", "none")
@@ -660,6 +768,7 @@ def reconstruct_visual_hull(
     resolution: int = 88,
     carve_concavity: bool = True,
     shape_prior: str = "auto",
+    view_angles: Sequence[tuple[float, float]] | None = None,
 ) -> VisualHullResult:
     """Reconstruct a watertight 3D mesh from multi-view silhouettes.
 
@@ -670,6 +779,11 @@ def reconstruct_visual_hull(
       otherwise fall back to visual-hull carving.
     - ``"revolution"``: always use the surface-of-revolution model.
     - ``"none"``: always use visual-hull carving.
+
+    ``view_angles`` optionally gives each photo's camera (azimuth, elevation)
+    in degrees, elevation positive when looking down (e.g. from a turntable
+    rig). Silhouettes alone cannot pin down camera poses for arbitrary
+    objects, so known angles make visual-hull carving far more accurate.
     """
     if isinstance(images, (str, bytes)):
         raise InputError("Expected a sequence of decoded PIL images.")
@@ -697,13 +811,26 @@ def reconstruct_visual_hull(
     if not isinstance(carve_concavity, bool):
         raise ConfigurationError("carve_concavity must be True or False.")
 
+    if view_angles is not None:
+        try:
+            angles = np.asarray(view_angles, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            raise ConfigurationError("view_angles must be numeric pairs.") from exc
+        if angles.shape != (len(view_images), 2) or not np.isfinite(angles).all():
+            raise ConfigurationError(
+                "view_angles needs one (azimuth, elevation) pair per image."
+            )
+        if np.any(np.abs(angles[:, 1]) > 90.0):
+            raise ConfigurationError("Elevations must lie within [-90, 90] degrees.")
+        view_angles = [tuple(map(float, a)) for a in angles]
+
     if shape_prior not in SHAPE_PRIORS:
         raise ConfigurationError(
             f"shape_prior must be one of: {', '.join(SHAPE_PRIORS)}."
         )
 
     if intrinsics is None:
-        focal = float(max(width, height)) * 1.4
+        focal = float(max(width, height)) * 4.0
         intrinsics = CameraIntrinsics.from_focal_length(width, height, focal)
     elif (intrinsics.image_width, intrinsics.image_height) != (width, height):
         raise ReconstructionError(
@@ -715,9 +842,7 @@ def reconstruct_visual_hull(
             raise InputError("Mask count must match the number of images.")
         bool_masks = tuple(np.asarray(m) > 0 for m in masks)
     else:
-        bool_masks = tuple(
-            extract_foreground_mask(img) > 0 for img in view_images
-        )
+        bool_masks = tuple(extract_foreground_mask(img) > 0 for img in view_images)
 
     if any(not np.any(m) for m in bool_masks):
         raise ReconstructionError(
@@ -749,132 +874,133 @@ def reconstruct_visual_hull(
             )
         )
 
-    aspect_ratios = [bh / bw for _, _, bw, bh in mask_info]
-    anchor = int(np.argmin(aspect_ratios))
-    base_tz = 2.0 * intrinsics.fx / mask_info[anchor][2]
+    if view_angles is not None:
+        resolved_poses = _known_view_poses(bool_masks, view_angles, intrinsics)
+    else:
+        aspect_ratios = [bh / bw for _, _, bw, bh in mask_info]
+        anchor = int(np.argmin(aspect_ratios))
+        base_tz = 2.0 * intrinsics.fx / mask_info[anchor][2]
 
-    def init_translation(idx: int, tz: float) -> tuple[float, float, float]:
-        mx, my, _, _ = mask_info[idx]
-        return (
-            (mx - intrinsics.cx) / intrinsics.fx * tz,
-            (my - intrinsics.cy) / intrinsics.fy * tz,
-            tz,
-        )
-
-    pts_coarse = _make_voxel_grid(44, 1.05)
-    r_anchor, t_anchor = _pose_from_euler(
-        0.0, 0.0, 0.0, *init_translation(anchor, base_tz)
-    )
-    cam_a = pts_coarse @ r_anchor.T + t_anchor.reshape(1, 3)
-    u_a = np.round(intrinsics.fx * (cam_a[:, 0] / cam_a[:, 2]) + intrinsics.cx).astype(
-        np.int32
-    )
-    v_a = np.round(intrinsics.fy * (cam_a[:, 1] / cam_a[:, 2]) + intrinsics.cy).astype(
-        np.int32
-    )
-    in_a = (u_a >= 0) & (u_a < width) & (v_a >= 0) & (v_a < height)
-    keep_a = np.zeros(len(pts_coarse), dtype=bool)
-    keep_a[in_a] = bool_masks[anchor][v_a[in_a], u_a[in_a]]
-
-    thick_map = _inflate_anchor_thickness(
-        bool_masks[anchor], mask_info[anchor][2], mask_info[anchor][3]
-    )
-    z_radius = np.zeros(len(pts_coarse), dtype=np.float32)
-    z_radius[keep_a] = thick_map[v_a[keep_a], u_a[keep_a]] * (base_tz / intrinsics.fx)
-    hull_anchor = pts_coarse[keep_a & (np.abs(pts_coarse[:, 2]) <= z_radius)]
-
-    poses: list[tuple[np.ndarray, np.ndarray] | None] = [None] * len(view_images)
-    poses[anchor] = (r_anchor, t_anchor)
-
-    for idx in sorted(range(len(view_images)), key=lambda i: -aspect_ratios[i]):
-        if idx == anchor:
-            continue
-        registered = [j for j in range(len(view_images)) if poses[j] is not None]
-        if len(registered) == 1:
-            hull_pts = hull_anchor
-        else:
-            occ = _carve_voxels(
-                pts_coarse,
-                [poses[j] for j in registered if poses[j] is not None],
-                [bool_masks[j] for j in registered],
-                intrinsics,
+        def init_translation(idx: int, tz: float) -> tuple[float, float, float]:
+            mx, my, _, _ = mask_info[idx]
+            return (
+                (mx - intrinsics.cx) / intrinsics.fx * tz,
+                (my - intrinsics.cy) / intrinsics.fy * tz,
+                tz,
             )
-            hull_pts = pts_coarse[occ]
-            if len(hull_pts) == 0:
-                hull_pts = hull_anchor
 
-        if len(hull_pts) > 2500:
-            hull_pts = hull_pts[
-                np.linspace(0, len(hull_pts) - 1, 2500, dtype=int)
-            ]
-
-        tx0, ty0, tz0 = init_translation(idx, base_tz)
-        best = (1e9, 0.0, 0.0, 0.0)
-        for az in range(-30, 31, 15):
-            for el in range(-88, 89, 8):
-                for roll in (-8, 0, 8):
-                    r_cand, t_cand = _pose_from_euler(az, el, roll, tx0, ty0, tz0)
-                    score = _evaluate_pose_silhouette(
-                        hull_pts,
-                        r_cand,
-                        t_cand,
-                        bool_masks[idx],
-                        dist_outside[idx],
-                        intrinsics,
-                        downsample=96,
-                        base_tz=tz0,
-                        roll_deg=float(roll),
-                    )
-                    if score < best[0]:
-                        best = (score, float(az), float(el), float(roll))
-
-        refined = _refine_pose_bounded(
-            hull_pts,
-            [best[1], best[2], best[3], tx0, ty0, tz0],
-            bool_masks[idx],
-            dist_outside[idx],
-            intrinsics,
-            base_tz=base_tz,
-            angle_bound=15.0,
-            trans_bound=0.4,
-            maxiter=140,
+        pts_coarse = _make_voxel_grid(44, 1.05)
+        r_anchor, t_anchor = _pose_from_euler(
+            0.0, 0.0, 0.0, *init_translation(anchor, base_tz)
         )
-        poses[idx] = _pose_from_euler(*refined)
+        cam_a = pts_coarse @ r_anchor.T + t_anchor.reshape(1, 3)
+        u_a = np.round(
+            intrinsics.fx * (cam_a[:, 0] / cam_a[:, 2]) + intrinsics.cx
+        ).astype(np.int32)
+        v_a = np.round(
+            intrinsics.fy * (cam_a[:, 1] / cam_a[:, 2]) + intrinsics.cy
+        ).astype(np.int32)
+        in_a = (u_a >= 0) & (u_a < width) & (v_a >= 0) & (v_a < height)
+        keep_a = np.zeros(len(pts_coarse), dtype=bool)
+        keep_a[in_a] = bool_masks[anchor][v_a[in_a], u_a[in_a]]
 
-    resolved_poses = [pose for pose in poses if pose is not None]
-    for refine_res in (56, 72):
-        pts_r = _make_voxel_grid(refine_res, 1.1)
-        occ_all = _carve_voxels(pts_r, resolved_poses, bool_masks, intrinsics)
-        hull_all = pts_r[occ_all]
-        if len(hull_all) == 0:
-            break
-        if len(hull_all) > 3500:
-            hull_all = hull_all[
-                np.linspace(0, len(hull_all) - 1, 3500, dtype=int)
-            ]
-        for idx in range(len(view_images)):
-            r_cur, t_cur = resolved_poses[idx]
-            eul_cur = Rotation.from_matrix(r_cur).as_euler("zxy", degrees=True)
-            x0 = [
-                float(eul_cur[2]),
-                float(eul_cur[1]),
-                float(eul_cur[0]),
-                float(t_cur[0]),
-                float(t_cur[1]),
-                float(t_cur[2]),
-            ]
+        thick_map = _inflate_anchor_thickness(
+            bool_masks[anchor], mask_info[anchor][2], mask_info[anchor][3]
+        )
+        z_radius = np.zeros(len(pts_coarse), dtype=np.float32)
+        z_radius[keep_a] = thick_map[v_a[keep_a], u_a[keep_a]] * (
+            base_tz / intrinsics.fx
+        )
+        hull_anchor = pts_coarse[keep_a & (np.abs(pts_coarse[:, 2]) <= z_radius)]
+
+        poses: list[tuple[np.ndarray, np.ndarray] | None] = [None] * len(view_images)
+        poses[anchor] = (r_anchor, t_anchor)
+
+        for idx in sorted(range(len(view_images)), key=lambda i: -aspect_ratios[i]):
+            if idx == anchor:
+                continue
+            registered = [j for j in range(len(view_images)) if poses[j] is not None]
+            if len(registered) == 1:
+                hull_pts = hull_anchor
+            else:
+                occ = _carve_voxels(
+                    pts_coarse,
+                    [poses[j] for j in registered if poses[j] is not None],
+                    [bool_masks[j] for j in registered],
+                    intrinsics,
+                )
+                hull_pts = pts_coarse[occ]
+                if len(hull_pts) == 0:
+                    hull_pts = hull_anchor
+
+            if len(hull_pts) > 2500:
+                hull_pts = hull_pts[np.linspace(0, len(hull_pts) - 1, 2500, dtype=int)]
+
+            tx0, ty0, tz0 = init_translation(idx, base_tz)
+            best = (1e9, 0.0, 0.0, 0.0)
+            for az in range(-30, 31, 15):
+                for el in range(-88, 89, 8):
+                    for roll in (-8, 0, 8):
+                        r_cand, t_cand = _pose_from_euler(az, el, roll, tx0, ty0, tz0)
+                        score = _evaluate_pose_silhouette(
+                            hull_pts,
+                            r_cand,
+                            t_cand,
+                            bool_masks[idx],
+                            dist_outside[idx],
+                            intrinsics,
+                            downsample=96,
+                            base_tz=tz0,
+                            roll_deg=float(roll),
+                        )
+                        if score < best[0]:
+                            best = (score, float(az), float(el), float(roll))
+
             refined = _refine_pose_bounded(
-                hull_all,
-                x0,
+                hull_pts,
+                [best[1], best[2], best[3], tx0, ty0, tz0],
                 bool_masks[idx],
                 dist_outside[idx],
                 intrinsics,
                 base_tz=base_tz,
-                angle_bound=8.0,
-                trans_bound=0.25,
-                maxiter=120,
+                angle_bound=15.0,
+                trans_bound=0.4,
+                maxiter=140,
             )
-            resolved_poses[idx] = _pose_from_euler(*refined)
+            poses[idx] = _pose_from_euler(*refined)
+
+        resolved_poses = [pose for pose in poses if pose is not None]
+        for refine_res in (56, 72):
+            pts_r = _make_voxel_grid(refine_res, 1.1)
+            occ_all = _carve_voxels(pts_r, resolved_poses, bool_masks, intrinsics)
+            hull_all = pts_r[occ_all]
+            if len(hull_all) == 0:
+                break
+            if len(hull_all) > 3500:
+                hull_all = hull_all[np.linspace(0, len(hull_all) - 1, 3500, dtype=int)]
+            for idx in range(len(view_images)):
+                r_cur, t_cur = resolved_poses[idx]
+                eul_cur = Rotation.from_matrix(r_cur).as_euler("zxy", degrees=True)
+                x0 = [
+                    float(eul_cur[2]),
+                    float(eul_cur[1]),
+                    float(eul_cur[0]),
+                    float(t_cur[0]),
+                    float(t_cur[1]),
+                    float(t_cur[2]),
+                ]
+                refined = _refine_pose_bounded(
+                    hull_all,
+                    x0,
+                    bool_masks[idx],
+                    dist_outside[idx],
+                    intrinsics,
+                    base_tz=base_tz,
+                    angle_bound=8.0,
+                    trans_bound=0.25,
+                    maxiter=120,
+                )
+                resolved_poses[idx] = _pose_from_euler(*refined)
 
     bound = 1.1
     pts_final = _make_voxel_grid(resolution, bound)
@@ -893,35 +1019,46 @@ def reconstruct_visual_hull(
             intrinsics,
         )
 
-    field = gaussian_filter(
-        occ_final.reshape(resolution, resolution, resolution).astype(np.float64),
-        sigma=0.75,
-    )
+    # Signed distance (in voxels) of the carved volume, lightly smoothed:
+    # a smoother iso-surface than blurring the binary occupancy.
+    occ_grid = occ_final.reshape(resolution, resolution, resolution)
+    sdf = distance_transform_edt(~occ_grid) - distance_transform_edt(occ_grid)
+    field = np.clip(0.5 - gaussian_filter(sdf, sigma=1.0) / 2.0, 0.0, 1.0)
     voxel_size = (2.0 * bound) / (resolution - 1)
     vertices, faces = marching_tetrahedra(
         field,
         [-bound, -bound, -bound],
         voxel_size,
-        level=0.45,
+        level=0.5,
     )
+    from .revolve import project_vertex_colors, taubin_smooth
+
+    vertices = taubin_smooth(vertices, faces)
 
     per_view_iou, per_view_dice = _silhouette_scores(
         vertices, faces, resolved_poses, bool_masks, intrinsics
     )
 
     rot_vecs = np.vstack(
-        [
-            Rotation.from_matrix(pose[0]).as_rotvec()
-            for pose in resolved_poses
-        ]
+        [Rotation.from_matrix(pose[0]).as_rotvec() for pose in resolved_poses]
     )
     trans_vecs = np.vstack([pose[1].reshape(3) for pose in resolved_poses])
+    colors = project_vertex_colors(
+        vertices,
+        faces,
+        view_images,
+        bool_masks,
+        [pose[0] for pose in resolved_poses],
+        [pose[1].reshape(3) for pose in resolved_poses],
+        intrinsics,
+    )
     mesh = MeshResult(
         vertices=vertices,
         faces=faces,
         alpha=None,
         input_point_count=int(np.count_nonzero(occ_final)),
         retained_point_count=len(vertices),
+        vertex_colors=colors,
     )
 
     return VisualHullResult(

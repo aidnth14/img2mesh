@@ -20,6 +20,12 @@
   detection from ~30 degree views, camera-elevation feedback, per-part
   out-of-plane thickness chosen by silhouette overlap. Benchmark (round
   objects): F@2% 0.42 -> 0.99, Chamfer 3.3% -> 0.6%, genus 5/7 -> 7/7.
+- Known camera angles (`view_angles=`, `--view-angles`) for silhouette
+  carving: non-round benchmark objects F@2% 0.35 -> 0.63, Chamfer 3.3% -> 1.9%.
+- Carved hulls now use a smoothed signed-distance surface plus Taubin
+  smoothing and carry projected vertex colours.
+- Silhouette mode assumes a longer lens by default (focal = 4x image size),
+  matching product photography (real cup sample IoU 0.94 -> 0.96).
 - Marching tetrahedra no longer leaves pinholes when grid values sit within
   ~1e-7 of the iso-level.
 
