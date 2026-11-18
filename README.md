@@ -157,6 +157,26 @@ guesses on these renders are far weaker than the stand-in, mostly in
 thickness, which silhouettes cannot correct. On the real cup photos the
 TripoSR path matches the revolution prior (silhouette IoU 0.957).
 
+### meshref: calibration on real scanned objects
+
+`img2mesh.benchmark.meshref` builds a reference set from Google Scanned
+Objects (real household items 3D-scanned by Google Research, CC BY 4.0):
+6 product-style photos per object (plus a held-out photo), the true model,
+attribution, and a stratified 80/20 train/test split. It then measures
+img2mesh against the true shapes and calibrates the decision thresholds of
+the `auto` path on the training objects only, reporting accuracy on the
+untouched test objects.
+
+```bash
+python -m img2mesh.benchmark.meshref build RAW_DIR chosen.json ~/Desktop/meshref
+python -m img2mesh.benchmark.meshref evaluate ~/Desktop/meshref --workers 6
+python -m img2mesh.benchmark.meshref calibrate ~/Desktop/meshref
+python -m img2mesh.benchmark.meshref reconstruct ~/Desktop/meshref
+```
+
+`RAW_DIR/<name>/` holds each scan's `model.obj` and `texture.png`
+(`https://fuel.gazebosim.org/1.0/GoogleResearch/models/<name>/tip/files/...`).
+
 ### CLI Options
 
 ```text
@@ -208,7 +228,8 @@ src/img2mesh/
   prior.py      Reconstruction guided by an external/learned prior mesh
   learned.py    Optional learned backends (TripoSR) producing prior meshes
   validate.py   Leave-one-out validation, strategy selection, quality report
-  benchmark/    Synthetic objects, renderer, shape metrics, benchmark runner
+  benchmark/    Synthetic objects, renderer, shape metrics, benchmark runner,
+                meshref (real scanned objects: dataset, evaluation, calibration)
   silhouette.py Foreground masks, visual hull, marching tetrahedra
 tests/
   test_cli.py
@@ -217,6 +238,7 @@ tests/
   test_image.py
   test_io.py
   test_benchmark.py
+  test_meshref.py
   test_pipeline.py
   test_prior.py
   test_revolve.py

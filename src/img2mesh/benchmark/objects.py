@@ -492,6 +492,118 @@ def _mannequin() -> BenchObject:
     )
 
 
+def _parts(parts: list[tuple[Field, tuple[float, float, float]]], k: float):
+    """Smooth union of parts, coloured by whichever part is nearest."""
+    fields = [f for f, _ in parts]
+    colours = np.asarray([c for _, c in parts], dtype=np.float64)
+    sdf = smooth_union(fields, k)
+
+    def albedo(points: np.ndarray) -> np.ndarray:
+        nearest = np.argmin(np.vstack([f(points) for f in fields]), axis=0)
+        base = colours[nearest]
+        q = np.floor(points * 160.0)
+        noise = np.sin(q @ np.array([12.9898, 78.233, 37.719])) * 43758.5453
+        noise = noise - np.floor(noise)
+        return np.clip(base * (1.0 + 0.08 * (noise - 0.5))[:, None], 0.0, 1.0)
+
+    return sdf, albedo
+
+
+def _scaled(field: Field, scale: tuple[float, float, float]) -> Field:
+    """Anisotropically scaled field (distance is a conservative bound)."""
+    s = np.asarray(scale, dtype=np.float64)
+
+    def sdf(points: np.ndarray) -> np.ndarray:
+        return field(points / s) * float(s.min())
+
+    return sdf
+
+
+def _ea_nasir() -> BenchObject:
+    """Ea-nasir, Old Babylonian copper merchant of Ur (c. 1750 BC).
+
+    No likeness of him survives: this is an imagined figure in period dress
+    (fringed wool robe and shawl, long beard, hands clasped as in Mesopotamian
+    statuary) holding a copper bun ingot, on a stone base.
+    """
+    robe_profile = RevolvedSection(
+        vessel_section(lambda y: 0.142 - 0.05 * (y / 0.52) ** 1.3, 0.52, hollow=False)
+    )
+    robe, skin, hair = (0.24, 0.31, 0.56), (0.62, 0.45, 0.32), (0.11, 0.08, 0.06)
+    shawl, copper, stone = (0.66, 0.42, 0.18), (0.78, 0.43, 0.19), (0.46, 0.44, 0.41)
+
+    def pair(make):
+        return [make(1.0), make(-1.0)]
+
+    parts = [
+        (rounded_box((0.0, 0.015, 0.0), (0.2, 0.015, 0.17), 0.008), stone),
+        (
+            _scaled(
+                lambda p: robe_profile(p - np.array([0.0, 0.03, 0.0])), (1.0, 1.0, 0.82)
+            ),
+            robe,
+        ),
+        (ellipsoid((0.0, 0.64, 0.0), (0.105, 0.13, 0.078)), robe),
+        (
+            _scaled(
+                tapered_capsule((0.09, 0.5, 0.074), (-0.11, 0.75, 0.024), 0.03, 0.034),
+                (1.0, 1.0, 0.8),
+            ),
+            shawl,
+        ),
+        (ellipsoid((0.0, 0.755, 0.0), (0.135, 0.04, 0.07)), shawl),
+        (tapered_capsule((0.0, 0.77, 0.0), (0.0, 0.83, 0.005), 0.03, 0.026), skin),
+        (ellipsoid((0.0, 0.875, 0.005), (0.056, 0.066, 0.061)), skin),
+        (ellipsoid((0.0, 0.905, -0.008), (0.06, 0.042, 0.064)), hair),
+        (ellipsoid((0.0, 0.79, 0.04), (0.045, 0.058, 0.032)), hair),
+        (ellipsoid((0.0, 0.895, 0.052), (0.012, 0.012, 0.012)), skin),
+    ]
+    parts += [
+        (
+            tapered_capsule(
+                (s * 0.125, 0.745, 0.0), (s * 0.14, 0.62, 0.02), 0.033, 0.028
+            ),
+            robe,
+        )
+        for s in (1.0, -1.0)
+    ]
+    parts += [
+        (
+            tapered_capsule(
+                (s * 0.14, 0.62, 0.02), (s * 0.035, 0.665, 0.085), 0.027, 0.022
+            ),
+            skin,
+        )
+        for s in (1.0, -1.0)
+    ]
+    parts += [
+        (ellipsoid((0.0, 0.667, 0.098), (0.05, 0.03, 0.028)), skin),
+        (ellipsoid((0.0, 0.672, 0.128), (0.05, 0.019, 0.036)), copper),
+    ]
+    parts += [
+        (ellipsoid((s * 0.05, 0.04, 0.07), (0.03, 0.018, 0.045)), skin)
+        for s in (1.0, -1.0)
+    ]
+    del pair
+    sdf, albedo = _parts(parts, 0.012)
+    return BenchObject(
+        "ea_nasir",
+        "other",
+        sdf,
+        albedo,
+        _bounds([-0.21, 0.0, -0.18], [0.21, 0.97, 0.18]),
+        genus=0,
+        hollow=False,
+        notes=(
+            "Ea-nasir, Old Babylonian copper merchant of Ur (c. 1750 BC). No "
+            "likeness of him survives: an imagined figure in period dress "
+            "(fringed wool robe and shawl, long beard, hands clasped as in "
+            "Mesopotamian statuary) holding a copper bun ingot."
+        ),
+        tags=("figure", "artifact"),
+    )
+
+
 BUILDERS: dict[str, Callable[[], BenchObject]] = {
     "cup": _cup,
     "bowl": _bowl,
@@ -507,10 +619,147 @@ BUILDERS: dict[str, Callable[[], BenchObject]] = {
 }
 
 
+def _cuneiform_depth(width: int, height: int, lines: int, seed: int) -> np.ndarray:
+    """Depth map (0..1) of rows of wedge impressions, stylised cuneiform."""
+    import cv2
+
+    rng = np.random.default_rng(seed)
+    depth = np.zeros((height, width), dtype=np.float32)
+    margin_x, margin_y = 0.08 * width, 0.05 * height
+    pitch = (height - 2 * margin_y) / lines
+    size = 0.55 * pitch
+
+    def wedge(cx: float, cy: float, angle: float, length: float) -> None:
+        d = np.array([np.cos(angle), np.sin(angle)])
+        n = np.array([-d[1], d[0]])
+        head = np.array([cx, cy])
+        tri = np.array(
+            [
+                head - 0.25 * size * d + 0.28 * size * n,
+                head - 0.25 * size * d - 0.28 * size * n,
+                head + 0.35 * size * d,
+            ],
+            dtype=np.float32,
+        )
+        cv2.fillConvexPoly(
+            depth, np.round(tri * 4).astype(np.int32), 1.0, cv2.LINE_AA, 2
+        )
+        tail = head + length * size * d
+        cv2.line(
+            depth,
+            tuple(np.round(head * 4).astype(int)),
+            tuple(np.round(tail * 4).astype(int)),
+            0.55,
+            max(1, int(0.12 * size)),
+            cv2.LINE_AA,
+            2,
+        )
+
+    for row in range(lines):
+        y = margin_y + (row + 0.5) * pitch
+        x = margin_x + rng.uniform(0, 0.4) * size
+        while x < width - margin_x - size:
+            kind = rng.choice(["h", "v", "hh", "vv", "corner", "hv"])
+            if kind in ("h", "hh"):
+                for k in range(1 if kind == "h" else 2):
+                    wedge(x, y + (k - 0.5 * (kind == "hh")) * 0.35 * size, 0.0, 1.1)
+                x += 1.5 * size
+            elif kind in ("v", "vv"):
+                for k in range(1 if kind == "v" else 2):
+                    wedge(x + k * 0.4 * size, y - 0.45 * size, np.pi / 2, 0.9)
+                x += (0.9 + 0.4 * (kind == "vv")) * size
+            elif kind == "corner":
+                wedge(x, y, np.pi / 4, 0.25)
+                x += 0.7 * size
+            else:
+                wedge(x, y, 0.0, 0.8)
+                wedge(x + 0.9 * size, y - 0.45 * size, np.pi / 2, 0.9)
+                x += 1.6 * size
+            x += rng.uniform(0.15, 0.45) * size
+    return cv2.GaussianBlur(depth, (0, 0), 1.2)
+
+
+def _nanni_tablet() -> BenchObject:
+    """Nanni's complaint to Ea-nasir (British Museum 131236, Ur, c. 1750 BC).
+
+    A replica in proportion (11.6 x 5.0 x 2.6 cm), standing upright: baked
+    clay with slightly pillowed faces, a couple of chipped corners, and rows
+    of wedge impressions on both faces. The signs are stylised cuneiform, not
+    the tablet's actual text. Nanni complains that Ea-nasir delivered copper
+    ingots of poor quality and treated his messenger with contempt.
+    """
+    hx, hy, hz = 0.2155, 0.5, 0.112
+    center = np.array([0.0, hy, 0.0])
+    res_w, res_h = 440, 1024
+    front = _cuneiform_depth(res_w, res_h, 14, seed=1750)
+    back = _cuneiform_depth(res_w, res_h, 13, seed=1751)
+    groove = 0.006
+    box = rounded_box(tuple(center), (hx, hy, hz), 0.07)
+    # Shallow broken corners: carving spheres centred just outside the edge.
+    chips = [
+        ((hx + 0.035, 2 * hy + 0.02, hz * 0.7), 0.075),
+        ((hx + 0.05, 2 * hy - 0.06, hz * 0.9), 0.06),
+        ((-hx - 0.04, 0.03, -hz - 0.01), 0.07),
+    ]
+
+    def inscription(points: np.ndarray) -> np.ndarray:
+        u = (points[:, 0] + hx) / (2 * hx) * (res_w - 1)
+        v = (1.0 - points[:, 1] / (2 * hy)) * (res_h - 1)
+        coords = np.vstack((v, u))
+        f = map_coordinates(front, coords, order=1, mode="constant")
+        b = map_coordinates(back, coords, order=1, mode="constant")
+        return np.where(points[:, 2] >= 0, f, b)
+
+    def sdf(points: np.ndarray) -> np.ndarray:
+        q = (points - center) / np.array([hx, hy, hz])
+        pillow = (
+            0.012
+            * np.clip(1.0 - q[:, 0] ** 2, 0, 1)
+            * np.clip(1.0 - q[:, 1] ** 2, 0, 1)
+        )
+        d = box(points) - pillow + groove * inscription(points)
+        for c, r in chips:
+            d = np.maximum(d, r - np.linalg.norm(points - np.asarray(c), axis=1))
+        return d
+
+    def albedo(points: np.ndarray) -> np.ndarray:
+        base = np.array([0.66, 0.5, 0.36])
+        q = np.floor(points * 220.0)
+        noise = np.sin(q @ np.array([12.9898, 78.233, 37.719])) * 43758.5453
+        noise = noise - np.floor(noise)
+        mottle = np.sin(points @ np.array([23.0, 17.0, 29.0])) * 0.5 + 0.5
+        shade = 1.0 + 0.1 * (noise - 0.5) - 0.12 * mottle - 0.35 * inscription(points)
+        return np.clip(base[None, :] * shade[:, None], 0.0, 1.0)
+
+    return BenchObject(
+        "nanni_complaint_tablet",
+        "other",
+        sdf,
+        albedo,
+        _bounds([-hx, 0.0, -hz - 0.02], [hx, 2 * hy, hz + 0.02]),
+        genus=0,
+        hollow=False,
+        notes=(
+            "Replica of Nanni's complaint tablet to Ea-nasir (British Museum "
+            "131236, Ur, c. 1750 BC) in proportion (11.6 x 5.0 x 2.6 cm); "
+            "stylised cuneiform, not the actual text."
+        ),
+        tags=("artifact", "tablet"),
+    )
+
+
+# Historical artifacts: not part of the default benchmark run.
+ARTIFACTS: dict[str, Callable[[], BenchObject]] = {
+    "ea_nasir": _ea_nasir,
+    "nanni_complaint_tablet": _nanni_tablet,
+}
+
+
 def get_object(name: str) -> BenchObject:
+    builders = {**BUILDERS, **ARTIFACTS}
     try:
-        return BUILDERS[name]()
+        return builders[name]()
     except KeyError as exc:
         raise KeyError(
-            f"Unknown benchmark object '{name}'. Choose from: {', '.join(BUILDERS)}."
+            f"Unknown benchmark object '{name}'. Choose from: {', '.join(builders)}."
         ) from exc

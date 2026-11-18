@@ -367,7 +367,45 @@ def analyze_view(mask: np.ndarray) -> ViewAnalysis:
     )
 
 
-def is_surface_of_revolution(analyses: Sequence[ViewAnalysis]) -> bool:
+ROUND_MIRROR_MEDIAN = 0.93
+ROUND_MIRROR_MIN = 0.88
+ROUND_HEIGHT_SPREAD = 0.15
+ROUND_TOP_ASPECT = 0.85
+OPEN_TOP_MARGIN = 5.0
+
+
+def roundness_features(analyses: Sequence[ViewAnalysis]) -> dict[str, float | None]:
+    """The measurements the roundness test thresholds."""
+    side = [a for a in analyses if a.profile is not None]
+    mirrors = [a.mirror_iou for a in analyses]
+    heights = [a.height_ratio for a in side]
+    spread = (
+        (max(heights) - min(heights)) / max(float(np.median(heights)), 1e-9)
+        if len(heights) >= 2
+        else 0.0
+    )
+    tops = [
+        a.top_aspect if a.top_aspect is not None else 0.0
+        for a in analyses
+        if a.elevation_deg >= TOP_VIEW_MIN_ELEVATION
+    ]
+    return {
+        "has_side_view": float(bool(side)),
+        "mirror_median": float(np.median(mirrors)),
+        "mirror_min": float(min(mirrors)),
+        "height_spread": float(spread),
+        "top_aspect_min": float(min(tops)) if tops else None,
+    }
+
+
+def is_surface_of_revolution(
+    analyses: Sequence[ViewAnalysis],
+    *,
+    mirror_median: float | None = None,
+    mirror_min: float | None = None,
+    height_spread: float | None = None,
+    top_aspect: float | None = None,
+) -> bool:
     """Heuristic check that the views show one rotationally symmetric body.
 
     Requires a side-on view; left/right mirror symmetry of the (appendage
@@ -375,27 +413,32 @@ def is_surface_of_revolution(analyses: Sequence[ViewAnalysis]) -> bool:
     (a box's width changes with azimuth, a cup's does not); and a round
     outline from any top-down view.
     """
-    side = [a for a in analyses if a.profile is not None]
-    if not side:
+    f = roundness_features(analyses)
+    if not f["has_side_view"]:
         return False
-    mirrors = [a.mirror_iou for a in analyses]
-    if np.median(mirrors) < 0.93 or min(mirrors) < 0.88:
+    if f["mirror_median"] < (mirror_median or ROUND_MIRROR_MEDIAN):
         return False
-    heights = [a.height_ratio for a in side]
-    if len(heights) >= 2:
-        spread = (max(heights) - min(heights)) / max(float(np.median(heights)), 1e-9)
-        if spread > 0.15:
-            return False
-    for a in analyses:
-        if a.elevation_deg >= TOP_VIEW_MIN_ELEVATION:
-            if a.top_aspect is None or a.top_aspect < 0.85:
-                return False
-    return True
+    if f["mirror_min"] < (mirror_min or ROUND_MIRROR_MIN):
+        return False
+    if f["height_spread"] > (height_spread or ROUND_HEIGHT_SPREAD):
+        return False
+    top = f["top_aspect_min"]
+    return top is None or top >= (top_aspect or ROUND_TOP_ASPECT)
 
 
 def _detect_open_top(
-    analyses: Sequence[ViewAnalysis], grays: Sequence[np.ndarray]
+    analyses: Sequence[ViewAnalysis],
+    grays: Sequence[np.ndarray],
+    margin_threshold: float | None = None,
 ) -> bool:
+    margin = open_top_margin(analyses, grays)
+    threshold = OPEN_TOP_MARGIN if margin_threshold is None else margin_threshold
+    return margin is not None and margin > threshold
+
+
+def open_top_margin(
+    analyses: Sequence[ViewAnalysis], grays: Sequence[np.ndarray]
+) -> float | None:
     """Is the top open (a cup, bowl or vase) rather than closed (a lid, cap)?
 
     Seen from about 30 degrees up, an open vessel shows its shaded far inner
@@ -416,7 +459,7 @@ def _detect_open_top(
             if a.elevation_deg >= 12.0
         ]
         if not elevated:
-            return False
+            return None
         candidates = [min(elevated, key=lambda c: abs(c[0].elevation_deg - 30.0))]
     margins, weights = [], []
     for a, gray in candidates:
@@ -431,8 +474,8 @@ def _detect_open_top(
         margins.append(float(np.median(gray[rim])) - float(np.median(gray[inner])))
         weights.append(1.0 / (1.0 + abs(a.elevation_deg - 30.0) / 10.0))
     if not margins:
-        return False
-    return float(np.average(margins, weights=weights)) > 5.0
+        return None
+    return float(np.average(margins, weights=weights))
 
 
 def _smooth_max(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:

@@ -159,6 +159,7 @@ def evaluate(
     *,
     resolution: int,
     save_dir: Path | None = None,
+    extra: dict | None = None,
 ) -> BenchResult:
     result = BenchResult(obj.name, obj.category, method, gt_genus=obj.genus)
     train, held = list(views[:-1]), views[-1]
@@ -186,6 +187,7 @@ def evaluate(
         # Visual hull given the true view angles (as from a turntable rig).
         kwargs["shape_prior"] = "none"
         kwargs["view_angles"] = [(v.azimuth, v.elevation) for v in train]
+    kwargs.update(extra or {})
     start = time.perf_counter()
     try:
         recon = reconstruct_visual_hull([v.image for v in train], **kwargs)

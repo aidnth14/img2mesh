@@ -869,6 +869,7 @@ def reconstruct_visual_hull(
     prior_mesh: MeshResult | None = None,
     prior_up_axis: str | None = None,
     learned_backend: str | None = None,
+    hollow: bool | None = None,
 ) -> VisualHullResult:
     """Reconstruct a watertight 3D mesh from multi-view silhouettes.
 
@@ -896,6 +897,9 @@ def reconstruct_visual_hull(
     :mod:`img2mesh.prior`). ``prior_up_axis`` names its up axis if known.
     ``learned_backend`` (e.g. ``"triposr"``) generates that prior from the
     photo with the largest silhouette (see :mod:`img2mesh.learned`).
+    ``hollow`` forces the revolution model's top open (True) or closed
+    (False); by default it is detected (and closed if ``carve_concavity`` is
+    False).
     """
     if isinstance(images, (str, bytes)):
         raise InputError("Expected a sequence of decoded PIL images.")
@@ -1055,7 +1059,9 @@ def reconstruct_visual_hull(
             bool_masks,
             intrinsics,
             resolution=max(resolution + resolution // 2, 64),
-            hollow=None if carve_concavity else False,
+            hollow=hollow
+            if hollow is not None
+            else (None if carve_concavity else False),
             required=shape_prior == "revolution",
         )
         if revolved is not None:
