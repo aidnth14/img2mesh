@@ -185,8 +185,8 @@ def _find_appendages(
             continue  # a sliver along the body edge, not a part
         cy, cx = np.nonzero(comp)
         side = 1 if float(np.mean(cx)) > axis_x else -1
-        base = np.nanmedian(np.where(np.isfinite(radius[cy]), radius[cy], np.nan))
-        base = 0.0 if not np.isfinite(base) else float(base)
+        finite = radius[cy][np.isfinite(radius[cy])]
+        base = float(np.median(finite)) if len(finite) else 0.0
         found.append(
             Appendage(
                 mask=comp,
@@ -750,12 +750,36 @@ def _fit_pose(
     *,
     grid: int = 128,
     init: tuple[np.ndarray, np.ndarray] | None = None,
+    elevations: Sequence[float] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Fit a camera pose so the model silhouette matches ``view.mask``.
 
     ``points`` must densely sample the model surface: the silhouette is
     rendered by splatting them onto a ``grid``-sized crop around the mask.
     With ``init`` the orientation search is skipped and only refined.
+    ``elevations`` overrides the candidate elevations (by default those near
+    the view's rim-ellipse estimate, which only means something for round
+    objects).
+    """
+    return _fit_pose_candidates(
+        points, view, intrinsics, grid=grid, init=init, elevations=elevations, count=1
+    )[0]
+
+
+def _fit_pose_candidates(
+    points: np.ndarray,
+    view: ViewAnalysis,
+    intrinsics: CameraIntrinsics,
+    *,
+    grid: int = 128,
+    init: tuple[np.ndarray, np.ndarray] | None = None,
+    elevations: Sequence[float] | None = None,
+    count: int = 1,
+) -> list[tuple[np.ndarray, np.ndarray, float]]:
+    """Up to ``count`` distinct refined poses, best first (see ``_fit_pose``).
+
+    Symmetric shapes fit a view equally well from several orientations;
+    callers that combine views can pick a mutually consistent set.
     """
     vt = _ViewTarget(view.mask, grid)
     sx0, sy0, size, crop = vt.sx0, vt.sy0, vt.size, vt.crop
@@ -780,80 +804,95 @@ def _fit_pose(
         uv = np.column_stack(((s * px + a - sx0) * cscale, (s * py + b - sy0) * cscale))
         return _iou(_splat(uv, (coarse, coarse)), coarse_target), s, a, b
 
-    el_guess = view.elevation_deg
-    els = sorted(
-        {
-            float(np.clip(sign * (el_guess + d), -90.0, 90.0))
-            for sign in (1.0, -1.0)
-            for d in (-15.0, -7.5, 0.0, 7.5, 15.0)
-        }
-    )
+    if elevations is not None:
+        els = sorted({float(np.clip(e, -90.0, 90.0)) for e in elevations})
+    else:
+        el_guess = view.elevation_deg
+        els = sorted(
+            {
+                float(np.clip(sign * (el_guess + d), -90.0, 90.0))
+                for sign in (1.0, -1.0)
+                for d in (-15.0, -7.5, 0.0, 7.5, 15.0)
+            }
+        )
 
-    looks_up = _looks_up
     fx, fy, cx, cy = intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy
 
-    if init is not None:
-        rot0, t0 = init[0], np.asarray(init[1], dtype=np.float64).reshape(3)
+    def refine(rot0: np.ndarray, t0: np.ndarray):
         tz = float(t0[2])
-    else:
-        rot0, t0, tz = None, None, 0.0
 
-    best_score, best_params = -1.0, (0.0, 0.0, 0.0)
-    for az in range(0, 360, 10) if init is None else ():
+        def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            rot = Rotation.from_rotvec(params[:3]).as_matrix() @ rot0
+            return rot, t0 + params[3:] * np.array([1.0, 1.0, tz])
+
+        def objective(params: np.ndarray) -> float:
+            rot, trans = unpack(params)
+            if _looks_up(rot):
+                return 1.0
+            cam = points @ rot.T + trans
+            z = np.maximum(cam[:, 2], 1e-6)
+            uv = np.column_stack(
+                (
+                    (fx * cam[:, 0] / z + cx - sx0) * gscale,
+                    (fy * cam[:, 1] / z + cy - sy0) * gscale,
+                )
+            )
+            return -_iou(_splat(uv, (grid, grid)), target)
+
+        simplex = np.zeros((7, 6))
+        for k, step in enumerate((0.05, 0.05, 0.05, 0.03, 0.03, 0.05)):
+            simplex[k + 1, k] = step
+        opt = minimize(
+            objective,
+            np.zeros(6),
+            method="Nelder-Mead",
+            options={"initial_simplex": simplex, "maxiter": 400, "fatol": 1e-5},
+        )
+        rot, trans = unpack(opt.x)
+        return rot, trans, float(-opt.fun)
+
+    if init is not None:
+        return [refine(init[0], np.asarray(init[1], dtype=np.float64).reshape(3))]
+
+    scored = []
+    for az in range(0, 360, 10):
         for el in els:
             rot = _base_rotation(az, el)
-            if looks_up(rot):
+            if _looks_up(rot):
                 continue
-            score = ortho_fit(rot)[0]
-            if score > best_score:
-                best_score, best_params = score, (float(az), el, 0.0)
-    az0, el0, _ = best_params
-    for az in np.arange(az0 - 8.0, az0 + 9.0, 4.0) if init is None else ():
-        for el in np.arange(el0 - 6.0, el0 + 7.0, 3.0):
-            el_c = float(np.clip(el, -90.0, 90.0))
-            for roll in (-4.0, 0.0, 4.0):
-                rot = _base_rotation(az, el_c, roll)
-                if looks_up(rot):
-                    continue
-                score = ortho_fit(rot)[0]
-                if score > best_score:
-                    best_score, best_params = score, (float(az), el_c, roll)
+            scored.append((ortho_fit(rot)[0], float(az), el))
+    scored.sort(key=lambda c: -c[0])
+    seeds: list[tuple[float, float]] = []
+    for _, az, el in scored:
+        distinct = all(
+            min(abs(az - a) % 360.0, 360.0 - abs(az - a) % 360.0) >= 30.0
+            or abs(el - e) >= 20.0
+            for a, e in seeds
+        )
+        if distinct:
+            seeds.append((az, el))
+        if len(seeds) >= count:
+            break
 
-    if init is None:
+    results = []
+    for az0, el0 in seeds:
+        best_score, best_params = -1.0, (az0, el0, 0.0)
+        for az in np.arange(az0 - 8.0, az0 + 9.0, 4.0):
+            for el in np.arange(el0 - 6.0, el0 + 7.0, 3.0):
+                el_c = float(np.clip(el, -90.0, 90.0))
+                for roll in (-4.0, 0.0, 4.0):
+                    rot = _base_rotation(az, el_c, roll)
+                    if _looks_up(rot):
+                        continue
+                    score = ortho_fit(rot)[0]
+                    if score > best_score:
+                        best_score, best_params = score, (float(az), el_c, roll)
         rot0 = _base_rotation(*best_params)
         _, s, a, b = ortho_fit(rot0, points)
-        tz = fx / s
-        t0 = np.array([(a - cx) / s, (b - cy) / s, tz])
-
-    def unpack(params: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        rot = Rotation.from_rotvec(params[:3]).as_matrix() @ rot0
-        return rot, t0 + params[3:] * np.array([1.0, 1.0, tz])
-
-    def objective(params: np.ndarray) -> float:
-        rot, trans = unpack(params)
-        if looks_up(rot):
-            return 1.0
-        cam = points @ rot.T + trans
-        z = np.maximum(cam[:, 2], 1e-6)
-        uv = np.column_stack(
-            (
-                (fx * cam[:, 0] / z + cx - sx0) * gscale,
-                (fy * cam[:, 1] / z + cy - sy0) * gscale,
-            )
-        )
-        return -_iou(_splat(uv, (grid, grid)), target)
-
-    simplex = np.zeros((7, 6))
-    for k, step in enumerate((0.05, 0.05, 0.05, 0.03, 0.03, 0.05)):
-        simplex[k + 1, k] = step
-    opt = minimize(
-        objective,
-        np.zeros(6),
-        method="Nelder-Mead",
-        options={"initial_simplex": simplex, "maxiter": 400, "fatol": 1e-5},
-    )
-    rot, trans = unpack(opt.x)
-    return rot, trans, float(-opt.fun)
+        t0 = np.array([(a - cx) / s, (b - cy) / s, fx / s])
+        results.append(refine(rot0, t0))
+    results.sort(key=lambda r: -r[2])
+    return results
 
 
 def taubin_smooth(

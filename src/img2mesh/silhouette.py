@@ -769,6 +769,9 @@ def reconstruct_visual_hull(
     carve_concavity: bool = True,
     shape_prior: str = "auto",
     view_angles: Sequence[tuple[float, float]] | None = None,
+    prior_mesh: MeshResult | None = None,
+    prior_up_axis: str | None = None,
+    learned_backend: str | None = None,
 ) -> VisualHullResult:
     """Reconstruct a watertight 3D mesh from multi-view silhouettes.
 
@@ -784,6 +787,13 @@ def reconstruct_visual_hull(
     in degrees, elevation positive when looking down (e.g. from a turntable
     rig). Silhouettes alone cannot pin down camera poses for arbitrary
     objects, so known angles make visual-hull carving far more accurate.
+
+    ``prior_mesh`` supplies a shape prior, e.g. a mesh from a single-image 3D
+    generator, in any frame and scale. Cameras are fitted against it and the
+    result is the prior refined to match every silhouette (see
+    :mod:`img2mesh.prior`). ``prior_up_axis`` names its up axis if known.
+    ``learned_backend`` (e.g. ``"triposr"``) generates that prior from the
+    photo with the largest silhouette (see :mod:`img2mesh.learned`).
     """
     if isinstance(images, (str, bytes)):
         raise InputError("Expected a sequence of decoded PIL images.")
@@ -847,6 +857,41 @@ def reconstruct_visual_hull(
     if any(not np.any(m) for m in bool_masks):
         raise ReconstructionError(
             "Foreground segmentation produced an empty mask for one or more views."
+        )
+
+    if learned_backend is not None and prior_mesh is None:
+        from .learned import generate_prior_mesh
+
+        best = int(np.argmax([np.count_nonzero(m) for m in bool_masks]))
+        prior_mesh = generate_prior_mesh(
+            view_images[best], bool_masks[best], backend=learned_backend
+        )
+
+    if prior_mesh is not None:
+        from .prior import reconstruct_with_prior
+
+        mesh, prior_poses, _ = reconstruct_with_prior(
+            view_images,
+            bool_masks,
+            prior_mesh,
+            intrinsics,
+            resolution=max(resolution, 64),
+            up_axis=prior_up_axis,
+        )
+        ious, dices = _silhouette_scores(
+            mesh.vertices, mesh.faces, prior_poses, bool_masks, intrinsics
+        )
+        return VisualHullResult(
+            mesh=mesh,
+            camera_rotations=np.vstack(
+                [Rotation.from_matrix(r).as_rotvec() for r, _ in prior_poses]
+            ),
+            camera_translations=np.vstack([t.reshape(3) for _, t in prior_poses]),
+            intrinsics=intrinsics,
+            masks=tuple(m.astype(np.uint8) * 255 for m in bool_masks),
+            per_view_iou=ious,
+            per_view_dice=dices,
+            method="prior",
         )
 
     if shape_prior != "none":

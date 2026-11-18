@@ -26,6 +26,14 @@
   smoothing and carry projected vertex colours.
 - Silhouette mode assumes a longer lens by default (focal = 4x image size),
   matching product photography (real cup sample IoU 0.94 -> 0.96).
+- Shape priors from learned generators (`prior_mesh=`, `--prior-mesh`,
+  `--prior-up-axis`): cameras are fitted to the prior (up axis detected or
+  given, mutually consistent poses chosen by carving consistency), the
+  visual hull is intersected with the prior and coloured from the photos.
+  Optional `learned_backend=` / `--learned-prior triposr` generates the prior
+  (`img2mesh.learned`, lazy optional dependencies, pluggable registry).
+  Benchmark with a simulated prior: non-round objects F@2% 0.36 -> 0.84.
+- `img2mesh.io.load_mesh` reads .obj, .stl (binary/ASCII, welded) and .glb.
 - Marching tetrahedra no longer leaves pinholes when grid values sit within
   ~1e-7 of the iso-level.
 

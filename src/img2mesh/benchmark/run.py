@@ -19,7 +19,9 @@ cameras, refined by ICP) and scored with:
 - the method's self-reported IoU on its own input views, for contrast.
 
 Methods: ``auto`` / ``revolution`` / ``none`` are the shape priors; ``angles``
-is visual-hull carving given the true view angles.
+is visual-hull carving given the true view angles; ``prior`` refines a
+simulated learned prior (see :func:`simulated_learned_prior`) whose up axis is
+found automatically, ``prior_up`` the same prior with its up axis given.
 """
 
 from __future__ import annotations
@@ -92,6 +94,40 @@ def ground_truth_mesh(
     return marching_tetrahedra(field, lo, voxel, level=0.5)
 
 
+def simulated_learned_prior(
+    vertices: np.ndarray, faces: np.ndarray, seed: int = 0
+) -> MeshResult:
+    """Stand-in for a single-image 3D generator's output.
+
+    The ground truth, over-smoothed (plain Laplacian smoothing shrinks and
+    blurs details), perturbed by noise of ~1.5% of its size, and put in
+    an arbitrary frame: Z up, rotated about the up axis, rescaled, offset.
+    It measures how well a decent-but-imperfect prior is exploited; it is not
+    a measurement of any particular learned model.
+    """
+    rng = np.random.default_rng(seed)
+    edges = np.vstack((faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]))
+    edges = np.unique(np.sort(edges, axis=1), axis=0)
+    counts = np.maximum(np.bincount(edges.ravel(), minlength=len(vertices)), 1)
+    v = vertices.copy()
+    for _ in range(12):
+        summed = np.zeros_like(v)
+        np.add.at(summed, edges[:, 0], v[edges[:, 1]])
+        np.add.at(summed, edges[:, 1], v[edges[:, 0]])
+        v = v + 0.5 * (summed / counts[:, None] - v)
+    size = float(np.max(np.ptp(vertices, axis=0)))
+    v = v + rng.normal(scale=0.015 * size / np.sqrt(3), size=v.shape)
+    frame = Rotation.from_euler("zx", [37.0, 90.0], degrees=True).as_matrix()
+    v = 3.1 * v @ frame.T + np.array([0.4, -1.2, 2.0])
+    return MeshResult(
+        vertices=v,
+        faces=faces,
+        alpha=None,
+        input_point_count=len(v),
+        retained_point_count=len(v),
+    )
+
+
 def _align(
     recon_pts: np.ndarray,
     gt_pts: np.ndarray,
@@ -128,7 +164,13 @@ def evaluate(
     diagonal = float(np.linalg.norm(np.ptp(gt_v, axis=0)))
 
     kwargs = {"resolution": resolution, "shape_prior": method}
-    if method == "angles":
+    if method in ("prior", "prior_up"):
+        kwargs["shape_prior"] = "none"
+        kwargs["prior_mesh"] = simulated_learned_prior(gt_v, gt_f)
+        if method == "prior_up":
+            # Generators output a fixed, documented orientation (Z up here).
+            kwargs["prior_up_axis"] = "+z"
+    elif method == "angles":
         # Visual hull given the true view angles (as from a turntable rig).
         kwargs["shape_prior"] = "none"
         kwargs["view_angles"] = [(v.azimuth, v.elevation) for v in train]
@@ -190,18 +232,18 @@ def _fmt(value: float, spec: str) -> str:
 
 def format_table(results: Sequence[BenchResult]) -> str:
     header = (
-        f"{'object':11s} {'method':6s} {'used':11s} {'F@2%':>5s} {'P':>5s} "
+        f"{'object':11s} {'method':8s} {'used':11s} {'F@2%':>5s} {'P':>5s} "
         f"{'R':>5s} {'F@1%':>5s} {'CD%':>5s} {'genus':>6s} {'novel':>6s} "
         f"{'self':>5s} {'sec':>5s}"
     )
     lines = [header, "-" * len(header)]
     for r in results:
         if r.error:
-            lines.append(f"{r.object:11s} {r.method:6s} ERROR {r.error}")
+            lines.append(f"{r.object:11s} {r.method:8s} ERROR {r.error}")
             continue
         genus = f"{r.genus}/{r.gt_genus}" if r.watertight else f"open/{r.gt_genus}"
         lines.append(
-            f"{r.object:11s} {r.method:6s} {r.used:11s} {_fmt(r.fscore, '.3f'):>5s} "
+            f"{r.object:11s} {r.method:8s} {r.used:11s} {_fmt(r.fscore, '.3f'):>5s} "
             f"{_fmt(r.precision, '.2f'):>5s} {_fmt(r.recall, '.2f'):>5s} "
             f"{_fmt(r.fscore_1pct, '.3f'):>5s} {_fmt(r.chamfer_pct, '.2f'):>5s} "
             f"{genus:>6s} {_fmt(r.novel_iou, '.3f'):>6s} "
@@ -224,7 +266,7 @@ def format_table(results: Sequence[BenchResult]) -> str:
                 continue
             genus_ok = sum(r.watertight and r.genus == r.gt_genus for r in rows)
             lines.append(
-                f"  {category:5s} {method:6s} "
+                f"  {category:5s} {method:8s} "
                 f"F={np.mean([r.fscore for r in rows]):.3f}  "
                 f"CD={np.mean([r.chamfer_pct for r in rows]):.2f}%  "
                 f"novel={np.mean([r.novel_iou for r in rows]):.3f}  "

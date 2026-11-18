@@ -550,3 +550,142 @@ def export_mesh(mesh: MeshResult, output_path, *, overwrite=False) -> Path:
         raise ExportError("Unsupported output format. Choose .obj, .stl, or .glb.")
 
     return exporter(mesh, output_path, overwrite=overwrite)
+
+
+def _mesh_from_arrays(vertices, faces) -> MeshResult:
+    vertices = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    if len(vertices) < 4 or len(faces) < 4:
+        raise InputError("Mesh file contains too little geometry.")
+    if not np.isfinite(vertices).all():
+        raise InputError("Mesh file contains non-finite coordinates.")
+    if faces.min() < 0 or faces.max() >= len(vertices):
+        raise InputError("Mesh file has face indices outside its vertex list.")
+    return MeshResult(
+        vertices=vertices,
+        faces=faces,
+        alpha=None,
+        input_point_count=len(vertices),
+        retained_point_count=len(vertices),
+    )
+
+
+def _load_obj(data: bytes) -> MeshResult:
+    vertices, faces = [], []
+    for raw in data.decode("utf-8", errors="replace").splitlines():
+        parts = raw.split()
+        if not parts:
+            continue
+        if parts[0] == "v" and len(parts) >= 4:
+            vertices.append([float(v) for v in parts[1:4]])
+        elif parts[0] == "f" and len(parts) >= 4:
+            idx = []
+            for token in parts[1:]:
+                i = int(token.split("/")[0])
+                idx.append(i - 1 if i > 0 else len(vertices) + i)
+            for k in range(1, len(idx) - 1):  # fan-triangulate polygons
+                faces.append([idx[0], idx[k], idx[k + 1]])
+    return _mesh_from_arrays(vertices, faces)
+
+
+def _load_stl(data: bytes) -> MeshResult:
+    if len(data) >= 84:
+        count = struct.unpack_from("<I", data, 80)[0]
+        if 84 + count * 50 == len(data):
+            records = np.frombuffer(
+                data[84:],
+                dtype=np.dtype([("n", "<f4", 3), ("v", "<f4", (3, 3)), ("a", "<u2")]),
+            )
+            corners = records["v"].reshape(-1, 3).astype(np.float64)
+            return _weld(corners)
+    corners = [
+        [float(v) for v in line.split()[1:4]]
+        for line in data.decode("utf-8", errors="replace").splitlines()
+        if line.strip().startswith("vertex")
+    ]
+    return _weld(np.asarray(corners, dtype=np.float64))
+
+
+def _weld(corners: np.ndarray) -> MeshResult:
+    """Merge the duplicated per-triangle corners of an STL into shared vertices."""
+    scale = float(np.max(np.ptp(corners, axis=0))) if len(corners) else 1.0
+    keys = np.round(corners / max(scale, 1e-12) * 1e7).astype(np.int64)
+    _, first, inverse = np.unique(keys, axis=0, return_index=True, return_inverse=True)
+    return _mesh_from_arrays(corners[first], inverse.reshape(-1, 3))
+
+
+_GLTF_COMPONENTS = {
+    5120: "i1",
+    5121: "u1",
+    5122: "<i2",
+    5123: "<u2",
+    5125: "<u4",
+    5126: "<f4",
+}
+_GLTF_WIDTH = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4}
+
+
+def _load_glb(data: bytes) -> MeshResult:
+    if len(data) < 20 or data[:4] != b"glTF":
+        raise InputError("Not a binary glTF (.glb) file.")
+    json_length, json_type = struct.unpack_from("<I4s", data, 12)
+    if json_type != b"JSON":
+        raise InputError("GLB file is missing its JSON chunk.")
+    document = json.loads(data[20 : 20 + json_length].decode("utf-8"))
+    offset = 20 + json_length
+    binary = b""
+    if offset + 8 <= len(data):
+        bin_length, _ = struct.unpack_from("<I4s", data, offset)
+        binary = data[offset + 8 : offset + 8 + bin_length]
+
+    def accessor(index: int) -> np.ndarray:
+        acc = document["accessors"][index]
+        view = document["bufferViews"][acc["bufferView"]]
+        dtype = np.dtype(_GLTF_COMPONENTS[acc["componentType"]])
+        width = _GLTF_WIDTH[acc["type"]]
+        start = view.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        stride = view.get("byteStride", 0) or dtype.itemsize * width
+        count = acc["count"]
+        raw = np.frombuffer(
+            binary,
+            dtype=np.uint8,
+            count=stride * (count - 1) + dtype.itemsize * width,
+            offset=start,
+        )
+        rows = np.lib.stride_tricks.as_strided(
+            raw, shape=(count, dtype.itemsize * width), strides=(stride, 1)
+        )
+        return np.ascontiguousarray(rows).view(dtype).reshape(count, width)
+
+    vertices, faces = [], []
+    for mesh in document.get("meshes", []):
+        for primitive in mesh.get("primitives", []):
+            if primitive.get("mode", 4) != 4:
+                continue
+            pos = accessor(primitive["attributes"]["POSITION"]).astype(np.float64)
+            if "indices" in primitive:
+                idx = accessor(primitive["indices"]).reshape(-1).astype(np.int64)
+            else:
+                idx = np.arange(len(pos), dtype=np.int64)
+            faces.append(idx.reshape(-1, 3) + sum(len(v) for v in vertices))
+            vertices.append(pos)
+    if not vertices:
+        raise InputError("GLB file contains no triangle meshes.")
+    return _mesh_from_arrays(np.vstack(vertices), np.vstack(faces))
+
+
+def load_mesh(path: str | Path) -> MeshResult:
+    """Load a triangle mesh from .obj, .stl or .glb (node transforms ignored)."""
+    source = Path(path).expanduser()
+    loaders = {".obj": _load_obj, ".stl": _load_stl, ".glb": _load_glb}
+    loader = loaders.get(source.suffix.lower())
+    if loader is None:
+        raise InputError("Unsupported mesh format. Use .obj, .stl or .glb.")
+    try:
+        data = source.read_bytes()
+    except OSError as exc:
+        raise InputError(f"Could not read mesh file '{source}': {exc}") from exc
+    try:
+        return loader(data)
+    except (ValueError, KeyError, IndexError, struct.error) as exc:
+        raise InputError(f"Could not parse mesh file '{source}': {exc}") from exc

@@ -70,6 +70,26 @@ at least one near side-on view (elevation below about 25°) and assumes the
 photos look at the object from the side or from above. GLB and OBJ exports
 carry per-vertex colour (STL has none).
 
+### Learned shape priors
+
+For arbitrary objects, a rough mesh from a single-image 3D generator
+(TripoSR, InstantMesh, Hunyuan3D, ...) removes the camera-pose ambiguity:
+img2mesh fits every photo's camera to the prior, carves with those cameras,
+intersects the result with the prior so it matches every silhouette, and
+projects colour from the photos.
+
+```bash
+img2mesh ./photos ./model.glb --mode silhouette --prior-mesh generated.glb --prior-up-axis +y
+img2mesh ./photos ./model.glb --mode silhouette --learned-prior triposr   # optional deps
+```
+
+The prior can be in any frame and scale (`--prior-up-axis` helps when its up
+direction is known; otherwise it is detected, less reliably for symmetric
+shapes). The built-in `triposr` backend needs `pip install torch
+git+https://github.com/VAST-AI-Research/TripoSR` and downloads its weights on
+first use; other generators can be registered with
+`img2mesh.learned.register_backend`.
+
 ### Accuracy benchmark
 
 `python -m img2mesh.benchmark` renders ten synthetic objects with known
@@ -84,7 +104,21 @@ contrast: carving-style methods score well on it even when the shape is wrong.
 python -m img2mesh.benchmark                                  # everything
 python -m img2mesh.benchmark --objects cup,box --methods auto,none
 python -m img2mesh.benchmark --json results.json --save-meshes meshes/
+python -m img2mesh.benchmark --methods none,auto,angles,prior_up
 ```
+
+Current results (F-score at 2% of object size; Chamfer as % of size):
+
+| Method | Round objects (7) | Other objects (3) |
+|---|---|---|
+| `none` (plain visual hull) | F 0.41, CD 3.3% | F 0.36, CD 3.3% |
+| `auto` (revolution prior) | **F 0.99, CD 0.6%** | F 0.36, CD 3.3% (falls back) |
+| `angles` (hull, known view angles) | F 0.68, CD 2.0% | F 0.72, CD 1.6% |
+| `prior_up` (simulated learned prior) | F 0.76, CD 1.4% | **F 0.84, CD 1.2%** |
+
+`prior_up` uses a degraded copy of the ground truth as a stand-in for a
+generator's output; it measures how well a decent prior is exploited, not
+the quality of any particular learned model.
 
 ### CLI Options
 
@@ -106,6 +140,10 @@ Options:
   --shape-prior {auto,revolution,none}
                             Silhouette shape model (default: auto)
   --view-angles AZ:EL,...   Known camera angles per photo (silhouette mode)
+  --prior-mesh PATH         Shape prior mesh (.obj/.stl/.glb) to fit and refine
+  --prior-up-axis {+x,-x,+y,-y,+z,-z}
+                            Up axis of the prior mesh, if known
+  --learned-prior BACKEND   Generate the prior with a learned backend
   --no-bundle-adjustment    Skip bundle adjustment refinement
   --focal-length FLOAT      Camera focal length in pixels
   --max-dimension INT       Resize images so max(width, height) <= INT
@@ -129,6 +167,8 @@ src/img2mesh/
   mesh.py       Point-cloud filtering and alpha-shape meshing
   pipeline.py   Bundle adjustment and incremental SfM pipeline
   revolve.py    Surface-of-revolution shape prior, pose fitting, vertex colours
+  prior.py      Reconstruction guided by an external/learned prior mesh
+  learned.py    Optional learned backends (TripoSR) producing prior meshes
   benchmark/    Synthetic objects, renderer, shape metrics, benchmark runner
   silhouette.py Foreground masks, visual hull, marching tetrahedra
 tests/
@@ -139,6 +179,7 @@ tests/
   test_io.py
   test_benchmark.py
   test_pipeline.py
+  test_prior.py
   test_revolve.py
   test_silhouette.py
 ```

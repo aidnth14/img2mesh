@@ -20,6 +20,7 @@ from .io import (
     export_mesh,
     extract_exif_focal_length,
     load_image,
+    load_mesh,
     validate_image_path,
 )
 from .mesh import generate_mesh
@@ -263,6 +264,31 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--prior-mesh",
+        type=Path,
+        default=None,
+        help=(
+            "Shape prior (.obj/.stl/.glb), e.g. from an image-to-3D generator, "
+            "in any frame and scale. Cameras are fitted to it and it is refined "
+            "to match every photo's silhouette (silhouette mode)."
+        ),
+    )
+    parser.add_argument(
+        "--prior-up-axis",
+        choices=("+x", "-x", "+y", "-y", "+z", "-z"),
+        default=None,
+        help="Up axis of the prior mesh, if known (default: detect).",
+    )
+    parser.add_argument(
+        "--learned-prior",
+        default=None,
+        metavar="BACKEND",
+        help=(
+            "Generate the shape prior with a learned backend (e.g. 'triposr'; "
+            "needs its optional dependencies)."
+        ),
+    )
+    parser.add_argument(
         "--no-bundle-adjustment",
         action="store_true",
         help="Skip bundle adjustment refinement.",
@@ -307,8 +333,14 @@ def _close_images(images) -> None:
             LOGGER.warning("Could not close an input image cleanly.")
 
 
-def _run_silhouette(images, reconstruction_kwargs, shape_prior: str, view_angles=None):
-    vh_kwargs = {"shape_prior": shape_prior}
+def _run_silhouette(
+    images,
+    reconstruction_kwargs,
+    shape_prior: str,
+    view_angles=None,
+    prior_options=None,
+):
+    vh_kwargs = {"shape_prior": shape_prior, **(prior_options or {})}
     if view_angles is not None:
         if len(view_angles) != len(images):
             raise InputError(
@@ -442,9 +474,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             if all(mask is not None for mask in masks):
                 reconstruction_kwargs["masks"] = masks
 
+        prior_options = {}
+        if args.prior_mesh is not None:
+            prior_options["prior_mesh"] = load_mesh(args.prior_mesh)
+        if args.prior_up_axis is not None:
+            prior_options["prior_up_axis"] = args.prior_up_axis
+        if args.learned_prior is not None:
+            prior_options["learned_backend"] = args.learned_prior
+        if prior_options and args.mode == "sfm":
+            raise InputError(
+                "--prior-mesh/--learned-prior need --mode silhouette or auto."
+            )
+
         if args.mode == "silhouette":
             mesh = _run_silhouette(
-                images, reconstruction_kwargs, args.shape_prior, args.view_angles
+                images,
+                reconstruction_kwargs,
+                args.shape_prior,
+                args.view_angles,
+                prior_options,
             )
         else:
             reconstruction = None
@@ -469,7 +517,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f" ({sfm_error})" if sfm_error else "",
                 )
                 mesh = _run_silhouette(
-                    images, reconstruction_kwargs, args.shape_prior, args.view_angles
+                    images,
+                    reconstruction_kwargs,
+                    args.shape_prior,
+                    args.view_angles,
+                    prior_options,
                 )
             else:
                 LOGGER.info(
