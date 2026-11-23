@@ -1,4 +1,5 @@
 import json
+import math
 
 import cv2
 import numpy as np
@@ -131,3 +132,21 @@ def test_decision_rule_and_calibration_use_only_training_objects(tmp_path):
     assert report["train"]["tuned"] > report["train"]["current"]
     assert report["test"]["tuned"] == pytest.approx(0.97)
     assert report["test"]["current"] == pytest.approx(0.3)
+
+
+def test_calibration_tolerates_objects_with_no_outcomes(tmp_path):
+    # A scan whose every reconstruction failed has outcomes that are all
+    # None; the oracle must skip it instead of crashing on max([]).
+    good = _record("g0", 0.70, -9.0, 0.2, 0.2, 0.6)
+    empty = _record("e0", 0.70, -9.0, 0.2, 0.2, 0.6)
+    empty["outcomes"] = {k: None for k in empty["outcomes"]}
+    records = tmp_path / "eval_records"
+    records.mkdir()
+    for r in (good, empty):
+        (records / f"{r['object']}.json").write_text(json.dumps(r))
+    (tmp_path / "split.json").write_text(
+        json.dumps({"train": ["g0", "e0"], "test": ["e0"]})
+    )
+    report = calibrate(tmp_path)
+    assert report["train"]["oracle"] == pytest.approx(0.6)
+    assert math.isnan(report["test"]["oracle"])

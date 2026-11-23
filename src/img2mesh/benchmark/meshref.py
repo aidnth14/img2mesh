@@ -543,18 +543,19 @@ def calibrate(out_dir: Path, masker: str = "color") -> dict:
             best_params, best_score = params, score
 
     def oracle(rs):
-        return float(
-            np.mean(
-                [
-                    max(
-                        o["fscore"]
-                        for k, o in r["outcomes"].items()
-                        if o and k != "carving_angles"
-                    )
-                    for r in rs
-                ]
+        vals = [
+            max(
+                (
+                    o["fscore"]
+                    for k, o in r["outcomes"].items()
+                    if o and k != "carving_angles"
+                ),
+                default=None,
             )
-        )
+            for r in rs
+        ]
+        vals = [v for v in vals if v is not None]
+        return float(np.mean(vals)) if vals else float("nan")
 
     def mean(rs, key):
         vals = [r["outcomes"][key]["fscore"] for r in rs if r["outcomes"].get(key)]
